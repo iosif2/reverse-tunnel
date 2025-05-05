@@ -15,101 +15,82 @@ use tracing::{debug, error, info, warn};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Server address (e.g., 1.2.3.4:7000)
+    // 명령어 인자 정의 구조체
+    /// 서버 주소
     #[arg(long = "server", short = 's')]
     server: String,
 
-    /// Backend port to expose (on this machine)
+    /// 백엔드 포트, 실제 로컬에서 서비스 되는 포트
     #[arg(long = "backend-port", short = 'b')]
     backend_port: u16,
 
-    /// Public port to expose on the server
+    /// 실제 인터넷에서 접속할 포트
     #[arg(long = "public-port", short = 'p')]
     public_port: u16,
 
-    /// Connection timeout in seconds for connecting to backend
+    /// 백엔드 서버에 연결시 타임아웃 시간
     #[arg(long = "connection-timeout", short = 't', default_value = "5")]
     connection_timeout: u64,
 
-    /// Idle timeout in seconds for backend connections (0 for no timeout)
+    /// 서버에 연결시 유후상태 타임아웃 시간
     #[arg(long = "idle-timeout", short = 'i', default_value = "0")]
     idle_timeout: u64,
 
-    /// Reconnection interval in seconds (0 to disable reconnection attempts)
+    /// 재연결 시도 인터벌
     #[arg(long = "reconnect-interval", short = 'r', default_value = "5")]
     reconnect_interval: u64,
 
-    /// Maximum number of reconnection attempts (0 for unlimited)
+    /// 재연결 시도 횟수 제한
     #[arg(long = "max-reconnect", short = 'm', default_value = "0")]
     max_reconnect_attempts: u32,
 }
 
-// Helper to parse HTTP responses
-fn parse_http_response(data: &[u8]) -> Option<(bool, bool)> {
-    let mut parser = HttpResponseParser::new();
-    parser.extend(data);
-
-    if !parser.is_complete() {
-        return None; // 불완전한 HTTP 응답
-    }
-
-    match parser.parse() {
-        Ok(response) => {
-            match response.connection_type {
-                ConnectionType::KeepAlive => Some((true, false)),
-                ConnectionType::Close => Some((false, true)),
-                ConnectionType::WebSocketUpgrade => Some((true, false)), // 웹소켓은 별도로 처리
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-// Check if a response is a WebSocket upgrade response
+// 웹소켓 업그레이드 응답인지 확인하는 함수
 fn is_websocket_upgrade_response(data: &[u8]) -> bool {
     let mut parser = HttpResponseParser::new();
     parser.extend(data);
     parser.is_websocket_upgrade()
 }
 
-// Detect a WebSocket Request
+// 웹소켓 업그레이드 요청인지 확인하는 함수
 fn is_websocket_request(data: &[u8]) -> bool {
     let mut parser = HttpRequestParser::new();
     parser.extend(data);
     parser.is_websocket_upgrade()
 }
 
-// Proxies data between the server and the backend service asynchronously
+// 서버로 부터 받은 데이터를 백엔드로 릴레이 하는 함수
 async fn handle_backend_connection(
     mut server_stream: TcpStream,
     backend_port: u16,
     connection_timeout: u64,
     idle_timeout: u64,
 ) {
-    // 연결 상태 추적
+    // 연결 상태
     let mut connection_state = ProxyConnectionState::Initial;
 
-    // Connect to the backend service on localhost:backend_port with timeout
+    // 백엔드 서비스와 연결하는 tcp 스트림 생성, 타임아웃이 적용됨
     let mut backend_stream = match timeout(
         Duration::from_secs(connection_timeout),
         TcpStream::connect(("127.0.0.1", backend_port)),
     )
-    .await
+    .await // 예외 처리 블록
     {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => stream, // 연결 성공 시 스트림 반환
         Ok(Err(e)) => {
-            error!("Failed to connect to backend:{}: {}", backend_port, e);
+            error!("Failed to connect to backend:{}: {}", backend_port, e); // 연결 실패 시 에러 로깅 후 반환
             return;
         }
         Err(_) => {
             error!(
-                "Connection timeout while connecting to backend:{}",
+                "Connection timeout while connecting to backend:{}", // 타임아웃 발생시 에러 로깅 후 반환
                 backend_port
             );
             return;
         }
     };
 
+    // 위 코드에서 연결 성공시 반환되지 않았으므로 연결 성공 로깅
     info!(
         "Proxy session established: server <-> backend:{}",
         backend_port
