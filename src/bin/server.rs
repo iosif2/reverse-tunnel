@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Command-line arguments for the reverse TCP proxy server
 #[derive(Parser, Debug)]
@@ -26,6 +26,14 @@ struct Args {
     /// Idle timeout in seconds for proxy sessions (0 for no timeout)
     #[arg(long = "idle-timeout", short = 'i', default_value = "0")]
     idle_timeout: u64,
+    
+    /// Data logging level (off, minimal, verbose)
+    #[arg(long = "data-logging", short = 'd', default_value = "off")]
+    data_logging: String,
+    
+    /// Size of data buffers in KB (32-1024)
+    #[arg(long = "buffer-size", short = 'b', default_value = "32")]
+    buffer_size: u32,
 }
 
 // Structure to hold information about a registered client
@@ -76,8 +84,13 @@ async fn handle_public_connection(
     mut client_stream: TcpStream,
     initial_data: Vec<u8>,
     idle_timeout: u64,
+    data_logging: String,
 ) {
     info!("Proxy session established: public <-> client");
+    
+    // 세션 추적을 위한 고유 ID 생성
+    let session_id = format!("{}", chrono::Utc::now().timestamp_millis());
+    info!("Starting proxy session {}", session_id);
 
     // 연결 상태 추적
     let mut connection_state = ProxyConnectionState::Initial;
@@ -101,27 +114,37 @@ async fn handle_public_connection(
         debug!("Failed to set SO_KEEPALIVE on client stream: {}", e);
     }
 
-    // Try to set receive and send buffer sizes
+    // Configure socket buffer sizes - 소켓 버퍼 크기 1MB로 증가
     let socket_ref = socket2::SockRef::from(&public_stream);
-    if let Err(e) = socket_ref.set_recv_buffer_size(262144) {
-        // 256KB
+    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) { // 1MB로 증가
         debug!("Failed to set receive buffer size on public stream: {}", e);
     }
-    if let Err(e) = socket_ref.set_send_buffer_size(262144) {
-        // 256KB
+    if let Err(e) = socket_ref.set_send_buffer_size(1048576) { // 1MB로 증가
         debug!("Failed to set send buffer size on public stream: {}", e);
     }
 
+    // 스트림 세부 정보 로깅 추가
+    if let Ok(local_addr) = public_stream.local_addr() {
+        if let Ok(peer_addr) = public_stream.peer_addr() {
+            info!("Public stream details: local={}, peer={}", local_addr, peer_addr);
+        }
+    }
+
     let socket_ref = socket2::SockRef::from(&client_stream);
-    if let Err(e) = socket_ref.set_recv_buffer_size(262144) {
-        // 256KB
+    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) { // 1MB로 증가
         debug!("Failed to set receive buffer size on client stream: {}", e);
     }
-    if let Err(e) = socket_ref.set_send_buffer_size(262144) {
-        // 256KB
+    if let Err(e) = socket_ref.set_send_buffer_size(1048576) { // 1MB로 증가
         debug!("Failed to set send buffer size on client stream: {}", e);
     }
 
+    // 스트림 세부 정보 로깅 추가
+    if let Ok(local_addr) = client_stream.local_addr() {
+        if let Ok(peer_addr) = client_stream.peer_addr() {
+            info!("Client stream details: local={}, peer={}", local_addr, peer_addr);
+        }
+    }
+    
     // HTTP 요청 파싱 및 연결 타입 결정
     let mut http_parser = HttpRequestParser::new();
     http_parser.extend(&initial_data);
@@ -218,122 +241,258 @@ async fn handle_public_connection(
     };
 
     // Forward data from public to client with optional timeout
-    let to_client = tokio::spawn(async move {
-        info!("Transferring data: public -> client");
+    let to_client = tokio::spawn({
+        let session_id = session_id.clone();
+        async move {
+            info!("Transferring data: public -> client");
+            let start_time = std::time::Instant::now();
 
-        let result = if let Some(timeout_duration) = idle_timeout_duration {
-            // With timeout - will abort if no data transfer happens within the timeout
-            let mut buffer = [0u8; 16384]; // Larger buffer for HTTP responses
-            let mut total_bytes: u64 = 0;
+            let result = if let Some(timeout_duration) = idle_timeout_duration {
+                // With timeout - will abort if no data transfer happens within the timeout
+                let mut buffer = [0u8; 32768]; // 버퍼 크기 32KB로 증가
+                let mut total_bytes: u64 = 0;
+                let start_time = std::time::Instant::now();
 
-            loop {
-                match timeout(timeout_duration, pr.read(&mut buffer)).await {
-                    Ok(Ok(0)) => break, // EOF
-                    Ok(Ok(n)) => match cw.write_all(&buffer[..n]).await {
-                        Ok(_) => {
-                            total_bytes += n as u64;
-                            debug!("public -> client: {} bytes transferred", n);
+                loop {
+                    match timeout(timeout_duration, pr.read(&mut buffer)).await {
+                        Ok(Ok(0)) => break, // EOF
+                        Ok(Ok(n)) => match cw.write_all(&buffer[..n]).await {
+                            Ok(_) => {
+                                // 데이터 즉시 플러시 추가
+                                if let Err(e) = cw.flush().await {
+                                    error!("Error flushing data to client: {}", e);
+                                    break;
+                                }
+                                
+                                total_bytes += n as u64;
+                                debug!("public -> client: {} bytes transferred", n);
+                                log_data_sample("public -> client", &buffer[..n], n, &data_logging);
+                                
+                                // 주기적으로 전송량 로그 출력 (1MB마다)
+                                if total_bytes % (1024 * 1024) < n as u64 {
+                                    let elapsed = start_time.elapsed();
+                                    let rate = if elapsed.as_secs() > 0 {
+                                        total_bytes as f64 / elapsed.as_secs() as f64
+                                    } else {
+                                        total_bytes as f64
+                                    };
+                                    
+                                    info!("Session {}: public -> client: {} bytes ({:.2} KB/s)", 
+                                         session_id, total_bytes, rate / 1024.0);
+                                }
+                                
+                                // 첫 100바이트 데이터 로깅 (트러블슈팅용)
+                                if n > 10 && total_bytes < 10000 {
+                                    info!("Data sample (public -> client): {:?}", &buffer[..std::cmp::min(n, 100)]);
+                                }
+                                
+                                if total_bytes > 100_000_000 { // 100MB 이상 전송시 경고
+                                    warn!("Large data transfer: public -> client: {} bytes total", total_bytes);
+                                }
+                                
+                                // 대용량 패킷은 처리 시간을 확보하기 위해 스레드 양보
+                                if n > 100000 {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            Err(e) => {
+                                if is_connection_error(&e) {
+                                    info!("public -> client: Connection closed: {}", e);
+                                } else {
+                                    error!("Error copying public -> client: {}", e);
+                                }
+                                break;
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            if is_connection_error(&e) {
+                                info!("public -> client: Connection closed: {}", e);
+                            } else {
+                                error!("Error reading from public: {}", e);
+                            }
+                            break;
                         }
+                        Err(_) => {
+                            info!(
+                                "public -> client: Idle timeout reached after {} seconds",
+                                timeout_duration.as_secs()
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(total_bytes)
+            } else {
+                // No timeout - use custom copy with logging
+                let mut buffer = [0u8; 32768];
+                let mut total_bytes: u64 = 0;
+                let start_time = std::time::Instant::now();
+                
+                loop {
+                    match pr.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => match cw.write_all(&buffer[..n]).await {
+                            Ok(_) => {
+                                // 데이터 즉시 플러시 추가
+                                if let Err(e) = cw.flush().await {
+                                    error!("Error flushing data to client: {}", e);
+                                    break;
+                                }
+                                
+                                total_bytes += n as u64;
+                                
+                                // 주기적으로 전송량 로그 출력 (1MB마다)
+                                if total_bytes % (1024 * 1024) < n as u64 {
+                                    let elapsed = start_time.elapsed();
+                                    let rate = if elapsed.as_secs() > 0 {
+                                        total_bytes as f64 / elapsed.as_secs() as f64
+                                    } else {
+                                        total_bytes as f64
+                                    };
+                                    
+                                    info!("Session {}: public -> client: {} bytes ({:.2} KB/s)", 
+                                         session_id, total_bytes, rate / 1024.0);
+                                }
+                            }
+                            Err(e) => {
+                                if is_connection_error(&e) {
+                                    info!("public -> client: Connection closed: {}", e);
+                                } else {
+                                    error!("Error copying public -> client: {}", e);
+                                }
+                                break;
+                            }
+                        },
                         Err(e) => {
                             if is_connection_error(&e) {
                                 info!("public -> client: Connection closed: {}", e);
                             } else {
-                                error!("Error copying public -> client: {}", e);
+                                error!("Error reading from public: {}", e);
                             }
                             break;
                         }
-                    },
-                    Ok(Err(e)) => {
-                        if is_connection_error(&e) {
-                            info!("public -> client: Connection closed: {}", e);
-                        } else {
-                            error!("Error reading from public: {}", e);
-                        }
-                        break;
-                    }
-                    Err(_) => {
-                        info!(
-                            "public -> client: Idle timeout reached after {} seconds",
-                            timeout_duration.as_secs()
-                        );
-                        break;
                     }
                 }
-            }
-            Ok(total_bytes)
-        } else {
-            // No timeout - use standard copy function
-            tokio::io::copy(&mut pr, &mut cw).await
-        };
+                
+                Ok(total_bytes)
+            };
 
-        match result {
-            Ok(bytes) => info!("public -> client: {} bytes transferred", bytes),
-            Err(e) => {
-                if is_connection_error(&e) {
-                    info!("public -> client: Connection closed: {}", e);
-                } else {
-                    error!("Error copying public -> client: {}", e);
+            match result {
+                Ok(bytes) => {
+                    let elapsed = start_time.elapsed();
+                    let rate = if elapsed.as_secs() > 0 {
+                        bytes as f64 / elapsed.as_secs() as f64
+                    } else {
+                        bytes as f64
+                    };
+                    
+                    info!("Session {}: public -> client completed: {} bytes transferred in {:.2}s ({:.2} KB/s)",
+                         session_id, bytes, elapsed.as_secs_f64(), rate / 1024.0);
+                    log_transfer_summary(&session_id, "public -> client", bytes);
+                }
+                Err(e) => {
+                    if is_connection_error(&e) {
+                        info!("public -> client: Connection closed: {}", e);
+                    } else {
+                        error!("Error copying public -> client: {}", e);
+                    }
                 }
             }
         }
     });
 
     // Forward data from client to public with optional timeout
-    let to_public = tokio::spawn(async move {
-        info!("Transferring data: client -> public");
+    let to_public = tokio::spawn({
+        let session_id = session_id.clone();
+        async move {
+            info!("Transferring data: client -> public");
+            let start_time = std::time::Instant::now();
 
-        let result = if let Some(timeout_duration) = idle_timeout_duration {
-            // With timeout - will abort if no data transfer happens within the timeout
-            let mut buffer = [0u8; 16384]; // Larger buffer for HTTP requests
-            let mut total_bytes: u64 = 0;
+            let result = if let Some(timeout_duration) = idle_timeout_duration {
+                // With timeout - will abort if no data transfer happens within the timeout
+                let mut buffer = [0u8; 32768]; // 버퍼 크기 32KB로 증가
+                let mut total_bytes: u64 = 0;
+                let start_time = std::time::Instant::now();
 
-            loop {
-                match timeout(timeout_duration, cr.read(&mut buffer)).await {
-                    Ok(Ok(0)) => break, // EOF
-                    Ok(Ok(n)) => match pw.write_all(&buffer[..n]).await {
-                        Ok(_) => {
-                            total_bytes += n as u64;
-                            debug!("client -> public: {} bytes transferred", n);
-                        }
-                        Err(e) => {
+                loop {
+                    match timeout(timeout_duration, cr.read(&mut buffer)).await {
+                        Ok(Ok(0)) => break, // EOF
+                        Ok(Ok(n)) => match pw.write_all(&buffer[..n]).await {
+                            Ok(_) => {
+                                // 데이터 즉시 플러시 추가
+                                if let Err(e) = pw.flush().await {
+                                    error!("Error flushing data to public: {}", e);
+                                    break;
+                                }
+                                
+                                total_bytes += n as u64;
+                                debug!("client -> public: {} bytes transferred, first bytes: {:?}", 
+                                       n, &buffer[..std::cmp::min(n, 20)]);
+                                
+                                // 주기적으로 전송량 로그 출력 (1MB마다)
+                                if total_bytes % (1024 * 1024) < n as u64 {
+                                    let elapsed = start_time.elapsed();
+                                    let rate = if elapsed.as_secs() > 0 {
+                                        total_bytes as f64 / elapsed.as_secs() as f64
+                                    } else {
+                                        total_bytes as f64
+                                    };
+                                    
+                                    info!("Session {}: client -> public: {} bytes ({:.2} KB/s)", 
+                                         session_id, total_bytes, rate / 1024.0);
+                                }
+                            }
+                            Err(e) => {
+                                if is_connection_error(&e) {
+                                    info!("client -> public: Connection closed: {}", e);
+                                } else {
+                                    error!("Error copying client -> public: {}", e);
+                                }
+                                break;
+                            }
+                        },
+                        Ok(Err(e)) => {
                             if is_connection_error(&e) {
                                 info!("client -> public: Connection closed: {}", e);
                             } else {
-                                error!("Error copying client -> public: {}", e);
+                                error!("Error reading from client: {}", e);
                             }
                             break;
                         }
-                    },
-                    Ok(Err(e)) => {
-                        if is_connection_error(&e) {
-                            info!("client -> public: Connection closed: {}", e);
-                        } else {
-                            error!("Error reading from client: {}", e);
+                        Err(_) => {
+                            info!(
+                                "client -> public: Idle timeout reached after {} seconds",
+                                timeout_duration.as_secs()
+                            );
+                            break;
                         }
-                        break;
-                    }
-                    Err(_) => {
-                        info!(
-                            "client -> public: Idle timeout reached after {} seconds",
-                            timeout_duration.as_secs()
-                        );
-                        break;
                     }
                 }
-            }
-            Ok(total_bytes)
-        } else {
-            // No timeout - use standard copy function
-            tokio::io::copy(&mut cr, &mut pw).await
-        };
+                Ok(total_bytes)
+            } else {
+                // No timeout - use standard copy function
+                tokio::io::copy(&mut cr, &mut pw).await
+            };
 
-        match result {
-            Ok(bytes) => info!("client -> public: {} bytes transferred", bytes),
-            Err(e) => {
-                if is_connection_error(&e) {
-                    info!("client -> public: Connection closed: {}", e);
-                } else {
-                    error!("Error copying client -> public: {}", e);
+            match result {
+                Ok(bytes) => {
+                    let elapsed = start_time.elapsed();
+                    let rate = if elapsed.as_secs() > 0 {
+                        bytes as f64 / elapsed.as_secs() as f64
+                    } else {
+                        bytes as f64
+                    };
+                    
+                    info!("Session {}: client -> public completed: {} bytes transferred in {:.2}s ({:.2} KB/s)",
+                         session_id, bytes, elapsed.as_secs_f64(), rate / 1024.0);
+                    log_transfer_summary(&session_id, "client -> public", bytes);
+                }
+                Err(e) => {
+                    if is_connection_error(&e) {
+                        info!("client -> public: Connection closed: {}", e);
+                    } else {
+                        error!("Error copying client -> public: {}", e);
+                    }
                 }
             }
         }
@@ -351,7 +510,7 @@ async fn handle_one_time_proxy(public_stream: &mut TcpStream, client_stream: &mu
     let mut response_parser = HttpResponseParser::new();
 
     // Create a buffer for the client response
-    let mut response_buffer = vec![0u8; 16384]; // 초기 버퍼 크기 줄임
+    let mut response_buffer = vec![0u8; 32768]; // 초기 버퍼 크기 32KB로 변경
 
     // Wait for response from client (with timeout)
     match timeout(
@@ -371,6 +530,12 @@ async fn handle_one_time_proxy(public_stream: &mut TcpStream, client_stream: &mu
                 // Forward response to public connection
                 if let Err(e) = public_stream.write_all(&response_buffer).await {
                     error!("Error sending response to public: {}", e);
+                    return;
+                }
+
+                // 명시적 플러시 추가
+                if let Err(e) = public_stream.flush().await {
+                    error!("Error flushing response to public: {}", e);
                     return;
                 }
 
@@ -491,13 +656,14 @@ async fn handle_one_time_proxy(public_stream: &mut TcpStream, client_stream: &mu
                                 response_parser.extend(&response_buffer[buf_pos..]);
 
                                 // Forward the additional data
-                                if let Err(e) =
-                                    public_stream.write_all(&response_buffer[buf_pos..]).await
-                                {
-                                    error!(
-                                        "Error sending additional response data to public: {}",
-                                        e
-                                    );
+                                if let Err(e) = public_stream.write_all(&response_buffer[buf_pos..]).await {
+                                    error!("Error sending additional response data to public: {}", e);
+                                    break;
+                                }
+
+                                // 명시적 플러시 추가
+                                if let Err(e) = public_stream.flush().await {
+                                    error!("Error flushing additional response data to public: {}", e);
                                     break;
                                 }
 
@@ -699,8 +865,7 @@ async fn handle_client(
                             is_keep_alive = keep_alive;
                             is_connection_close = connection_close;
                             request_path = path;
-                            info!("Detected HTTP request for path: {}, keep-alive: {}, connection-close: {}",
-                                   request_path, is_keep_alive, is_connection_close);
+                            info!("Detected HTTP request for path: {}, keep-alive: {}, connection-close: {}", request_path, is_keep_alive, is_connection_close);
                         }
 
                         // Debug: print the raw data received from the public connection
@@ -710,14 +875,9 @@ async fn handle_client(
                                 Ok(s) => {
                                     // Log the first line or up to 100 chars to avoid cluttering logs
                                     let preview = s.lines().next().unwrap_or("").chars().take(100).collect::<String>();
-                                    debug!("Received from public: {}{}",
-                                           preview,
-                                           if preview.len() < s.len() { "..." } else { "" });
+                                    debug!("Received from public: {}{}", preview, if preview.len() < s.len() { "..." } else { "" });
                                 },
-                                Err(_) => debug!("Received from public (hex): {}",
-                                                 data.iter().take(50)
-                                                     .map(|b| format!("{:02x}", b))
-                                                     .collect::<Vec<_>>().join(" ") + "..."),
+                                Err(_) => debug!("Received from public (hex): {}", data.iter().take(50).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ") + "..."),
                             }
                         }
 
@@ -792,7 +952,13 @@ async fn handle_client(
                         if let Some(client_stream) = session_stream {
                             info!("Spawning proxy handler for public connection");
                             tokio::spawn(async move {
-                                handle_public_connection(public_stream, client_stream, initial_data, idle_timeout).await;
+                                handle_public_connection(
+                                    public_stream, 
+                                    client_stream, 
+                                    initial_data,
+                                    idle_timeout,
+                                    "verbose".to_string()
+                                ).await;
                             });
                         } else {
                             error!("Failed to receive client connection, dropping public connection");
@@ -816,7 +982,7 @@ async fn handle_client(
 }
 
 // Handle WebSocket proxy with bidirectional streaming
-async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream: TcpStream) {
+async fn handle_websocket_proxy(public_stream: TcpStream, client_stream: TcpStream) {
     debug!("Starting WebSocket proxy mode");
 
     // For WebSockets, we need higher timeouts and keeping the connection open
@@ -829,7 +995,7 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
     // Forward data from public to client without any timeouts
     let to_client = tokio::spawn(async move {
         info!("WebSocket: Transferring data: public -> client");
-        let mut buffer = [0u8; 16384];
+        let mut buffer = [0u8; 32768]; // 버퍼 크기 32KB로 증가
         let mut total_bytes: u64 = 0;
 
         loop {
@@ -841,7 +1007,14 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
                 Ok(n) => {
                     match cw.write_all(&buffer[..n]).await {
                         Ok(_) => {
+                            // 데이터를 즉시 전송하기 위해 명시적으로 플러시 추가
+                            if let Err(e) = cw.flush().await {
+                                error!("WebSocket: Error flushing data to client: {}", e);
+                                break;
+                            }
+                            
                             total_bytes += n as u64;
+                            debug!("WebSocket: public -> client: {} bytes, data: {:?}", n, &buffer[..std::cmp::min(n, 50)]);
                             if total_bytes % 10240 == 0 {
                                 // Log every ~10KB
                                 debug!(
@@ -880,7 +1053,7 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
     // Forward data from client to public without any timeouts
     let to_public = tokio::spawn(async move {
         info!("WebSocket: Transferring data: client -> public");
-        let mut buffer = [0u8; 16384];
+        let mut buffer = [0u8; 32768]; // 버퍼 크기 32KB로 증가
         let mut total_bytes: u64 = 0;
 
         loop {
@@ -890,8 +1063,17 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
                     break;
                 }
                 Ok(n) => {
+                    // 데이터 내용 로깅
+                    debug!("WebSocket: Received from client: {} bytes, data: {:?}", n, &buffer[..std::cmp::min(n, 50)]);
+                    
                     match pw.write_all(&buffer[..n]).await {
                         Ok(_) => {
+                            // 데이터를 즉시 전송하기 위해 명시적으로 플러시 추가
+                            if let Err(e) = pw.flush().await {
+                                error!("WebSocket: Error flushing data to public: {}", e);
+                                break;
+                            }
+                            
                             total_bytes += n as u64;
                             if total_bytes % 10240 == 0 {
                                 // Log every ~10KB
@@ -899,6 +1081,11 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
                                     "WebSocket: client -> public: {} bytes transferred",
                                     total_bytes
                                 );
+                            }
+                            
+                            // 대용량 데이터 전송 시 경고 로그 추가
+                            if total_bytes > 100000 && total_bytes % 100000 < 10240 {
+                                warn!("WebSocket: Large data transfer: client -> public: {} bytes total", total_bytes);
                             }
                         }
                         Err(e) => {
@@ -928,8 +1115,113 @@ async fn handle_websocket_proxy(mut public_stream: TcpStream, mut client_stream:
         );
     });
 
-    let _ = tokio::try_join!(to_client, to_public);
-    info!("WebSocket proxy session closed");
+    match tokio::try_join!(to_client, to_public) {
+        Ok(_) => info!("WebSocket proxy session closed normally"),
+        Err(e) => warn!("WebSocket proxy session closed with error: {:?}", e),
+    }
+}
+
+// Update client activity timestamp to prevent session cleanup
+fn update_client_activity(clients: &Arc<Mutex<Vec<ClientInfo>>>, client_id: &str) {
+    tokio::spawn({
+        let clients = clients.clone();
+        let client_id = client_id.to_string();
+        async move {
+            let mut clients_lock = clients.lock().await;
+            for client in clients_lock.iter_mut() {
+                if client.handshake_id == client_id {
+                    client.last_activity = std::time::Instant::now();
+                    debug!("Updated activity timestamp for client: {}", client_id);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// 콜백 스트림 검증 함수 수정
+async fn validate_callback_stream(stream: &TcpStream, callback_id: &str) -> bool {
+    if let Ok(peer_addr) = stream.peer_addr() {
+        info!("Validating callback stream from {} for ID {}", peer_addr, callback_id);
+    } else {
+        warn!("Unable to get peer address for callback stream with ID {}", callback_id);
+    }
+    
+    // 소켓 정보 로깅
+    if let Ok(local_addr) = stream.local_addr() {
+        info!("Callback stream local address: {}", local_addr);
+    }
+    
+    // TCP 스트림 설정 확인
+    let socket_ref = socket2::SockRef::from(stream);
+    
+    // 소켓 옵션 검사
+    match socket_ref.keepalive() {
+        Ok(status) => info!("Callback stream keepalive status: {}", status),
+        Err(e) => warn!("Unable to get keepalive status: {}", e),
+    }
+    
+    // 버퍼 크기 로깅
+    if let Ok(size) = socket_ref.recv_buffer_size() {
+        info!("Callback stream receive buffer size: {} bytes", size);
+    }
+    if let Ok(size) = socket_ref.send_buffer_size() {
+        info!("Callback stream send buffer size: {} bytes", size);
+    }
+    
+    true
+}
+
+// Helper function to log data transfer summary
+fn log_transfer_summary(session_id: &str, direction: &str, bytes: u64) {
+    let size_str = if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    };
+    
+    info!("Session {}: {} transferred {}", session_id, direction, size_str);
+}
+
+// 특정 크기의 데이터를 로그 수준에 따라 출력하는 함수
+fn log_data_sample(direction: &str, data: &[u8], size: usize, log_level: &str) {
+    match log_level {
+        "verbose" => {
+            // 최대 200바이트까지 16진수와 텍스트로 출력
+            let preview_size = std::cmp::min(200, size);
+            let hex_dump = data[..preview_size]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+                
+            let ascii_dump: String = data[..preview_size]
+                .iter()
+                .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
+                .collect();
+                
+            info!("{} data[{}]: Hex: {}", direction, size, hex_dump);
+            info!("{} data[{}]: ASCII: {}", direction, size, ascii_dump);
+        },
+        "minimal" => {
+            // 처음 50바이트만 출력
+            if size > 0 {
+                let preview_size = std::cmp::min(50, size);
+                debug!("{} data preview[{}]: {:?}", 
+                      direction, size, &data[..preview_size]);
+            }
+        },
+        _ => {
+            // 로깅 없음 - 크기만 기록
+            if size > 10000 { // 10KB 이상만 로깅
+                debug!("{} data size: {} bytes", direction, size);
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -939,9 +1231,48 @@ async fn main() {
 
     // Parse command-line arguments
     let args = Args::parse();
+    
+    // 데이터 로깅 설정 출력
+    info!("Server started with data logging: {}, buffer size: {}KB", 
+          args.data_logging, args.buffer_size);
+    
+    // 버퍼 크기 유효성 검사
+    let buffer_size = if args.buffer_size < 32 {
+        warn!("Buffer size too small, setting to minimum 32KB");
+        32 * 1024
+    } else if args.buffer_size > 1024 {
+        warn!("Buffer size too large, setting to maximum 1024KB");
+        1024 * 1024
+    } else {
+        args.buffer_size as usize * 1024
+    };
 
     // Shared list of clients
     let clients: Arc<Mutex<Vec<ClientInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    
+    // 세션 클린업을 위한 클론
+    let clients_cleanup = clients.clone();
+    
+    // 주기적 세션 청소 작업
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            
+            let mut clients_lock = clients_cleanup.lock().await;
+            let before_count = clients_lock.len();
+            let now = std::time::Instant::now();
+            
+            // 5분 이상 활동이 없는 세션 제거
+            clients_lock.retain(|c| {
+                now.duration_since(c.last_activity).as_secs() < 300
+            });
+            
+            let removed = before_count - clients_lock.len();
+            if removed > 0 {
+                info!("Periodic cleanup: removed {} stale client sessions", removed);
+            }
+        }
+    });
 
     // Listen for client registrations on the specified address
     let listener = TcpListener::bind(&args.listen).await.unwrap();
@@ -950,9 +1281,14 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                // 연결 타임아웃 방지를 위한 노딜레이 설정
+                if let Err(e) = stream.set_nodelay(true) {
+                    debug!("Failed to set TCP_NODELAY on new connection: {}", e);
+                }
+                
                 // First check if this is a callback connection from an existing client
                 let handshake_id = {
-                    let mut callback_buf = [0; 1024];
+                    let mut callback_buf = [0; 2048]; // 콜백 버퍼 크기 증가
                     let mut callback_handshake = None;
 
                     // Try to peek at the data without consuming it
@@ -975,10 +1311,39 @@ async fn main() {
                 if let Some(id) = handshake_id {
                     info!("Received callback connection for handshake ID: {}", id);
 
-                    // Read and discard the CALLBACK line
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line).await;
+                    // stream을 mutable로 변경
+                    let mut stream = stream;
+                    
+                    // 스트림 검증
+                    validate_callback_stream(&stream, &id).await;
+
+                    // Read and discard the CALLBACK line manually
+                    let mut buf = [0u8; 1024];
+                    let mut callback_line = String::new();
+                    
+                    // 일반적인 패턴: "CALLBACK <id>\n" - 이를 수동으로 처리
+                    match stream.peek(&mut buf).await {
+                        Ok(n) => {
+                            if let Ok(data) = std::str::from_utf8(&buf[..n]) {
+                                callback_line = data.to_string();
+                                info!("Peeked callback data: '{}' ({} bytes)", 
+                                    data.trim().chars().take(100).collect::<String>(), n);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error peeking callback data: {}", e);
+                        }
+                    }
+                    
+                    // 실제로 데이터를 읽어서 버퍼에서 제거
+                    match stream.read(&mut buf).await {
+                        Ok(n) => {
+                            info!("Read and discarded {} bytes from callback", n);
+                        }
+                        Err(e) => {
+                            error!("Error reading callback data: {}", e);
+                        }
+                    }
 
                     let mut sender = None;
                     {
@@ -986,13 +1351,14 @@ async fn main() {
                         for client in clients_lock.iter_mut() {
                             if client.handshake_id == id {
                                 sender = client.handshake_channel.take();
+                                client.last_activity = std::time::Instant::now(); // 활동 시간 업데이트
                                 break;
                             }
                         }
                     }
 
                     if let Some(tx) = sender {
-                        match tx.send(reader.into_inner()) {
+                        match tx.send(stream) {
                             Ok(_) => info!(
                                 "Successfully forwarded callback connection for handshake ID: {}",
                                 id
