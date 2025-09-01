@@ -4,7 +4,81 @@ use httparse;
 use std::io;
 use tracing::{debug, error, info, warn};
 
-/// HTTP 요청을 파싱하는 구조체
+#[derive(Debug)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub version: String,
+    pub headers: HeaderMap,
+    pub body: Option<Vec<u8>>,
+    pub connection_type: ConnectionType,
+}
+
+impl HttpRequest {
+    pub fn is_websocket_upgrade(&self) -> bool {
+        let has_upgrade = if let Some(val) = self.headers.get("upgrade") {
+            val.to_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("websocket")
+        } else {
+            false
+        };
+
+        let has_connection_upgrade = if let Some(val) = self.headers.get("connection") {
+            val.to_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("upgrade")
+        } else {
+            false
+        };
+
+        let has_sec_websocket_key = self.headers.contains_key("sec-websocket-key");
+
+        has_upgrade && has_connection_upgrade && has_sec_websocket_key
+    }
+}
+
+#[derive(Debug)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub reason: String,
+    pub version: String,
+    pub headers: HeaderMap,
+    pub body: Option<Vec<u8>>,
+    pub connection_type: ConnectionType,
+}
+
+impl HttpResponse {
+    pub fn is_websocket_upgrade(&self) -> bool {
+        if self.status != 101 {
+            return false;
+        }
+
+        let has_upgrade = if let Some(val) = self.headers.get("upgrade") {
+            val.to_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("websocket")
+        } else {
+            false
+        };
+
+        let has_connection_upgrade = if let Some(val) = self.headers.get("connection") {
+            val.to_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("upgrade")
+        } else {
+            false
+        };
+
+        let has_sec_websocket_accept = self.headers.contains_key("sec-websocket-accept");
+
+        has_upgrade && has_connection_upgrade && has_sec_websocket_accept
+    }
+}
 pub struct HttpRequestParser {
     buf: BytesMut,
     headers: [httparse::Header<'static>; 64],
@@ -139,14 +213,12 @@ impl HttpRequestParser {
     }
 }
 
-/// HTTP 응답을 파싱하는 구조체
 pub struct HttpResponseParser {
     buf: BytesMut,
     headers: [httparse::Header<'static>; 64],
 }
 
 impl HttpResponseParser {
-    /// 새로운 HTTP 응답 파서 생성
     pub fn new() -> Self {
         Self {
             buf: BytesMut::with_capacity(8192),
@@ -154,21 +226,16 @@ impl HttpResponseParser {
         }
     }
 
-    /// 버퍼에 데이터 추가
     pub fn extend(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
     }
 
-    /// HTTP 응답이 완전한지 확인
     pub fn is_complete(&self) -> bool {
-        // 헤더의 끝을 찾음
         if let Some(headers_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            // 청크 인코딩 또는 Content-Length를 확인
             let headers_str = std::str::from_utf8(&self.buf[..headers_end])
                 .unwrap_or_default()
                 .to_lowercase();
 
-            // Content-Length가 있는 경우
             if headers_str.contains("content-length:") {
                 for line in headers_str.lines() {
                     if line.starts_with("content-length:") {
@@ -185,12 +252,10 @@ impl HttpResponseParser {
                 }
             }
 
-            // Transfer-Encoding: chunked인 경우
             if headers_str.contains("transfer-encoding: chunked") {
                 return self.buf.windows(5).any(|w| w == b"0\r\n\r\n");
             }
 
-            // 1xx, 204, 304 상태 코드는 본문이 없음
             let mut resp = [httparse::EMPTY_HEADER; 64];
             let mut res = httparse::Response::new(&mut resp);
             if let Ok(httparse::Status::Complete(_)) = res.parse(&self.buf) {
@@ -201,23 +266,17 @@ impl HttpResponseParser {
                 }
             }
 
-            // HEAD 요청에 대한 응답은 본문이 없음
-            // (클라이언트가 HEAD 요청을 보냈는지는 여기서 알 수 없으므로 처리하지 않음)
-
-            // 그 외의 경우, 헤더와 일부 본문이 있어야 함
             return headers_end + 4 < self.buf.len();
         }
         false
     }
 
-    /// HTTP 응답 파싱
     pub fn parse(&self) -> Result<HttpResponse, io::Error> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut res = httparse::Response::new(&mut headers);
 
         match res.parse(&self.buf) {
             Ok(httparse::Status::Complete(headers_len)) => {
-                // 상태 코드, 이유 구문, 버전 추출
                 let status = res.code.unwrap_or(200);
                 let reason = res.reason.unwrap_or("OK").to_string();
                 let version = match res.version.unwrap_or(1) {
@@ -226,7 +285,6 @@ impl HttpResponseParser {
                 }
                 .to_string();
 
-                // 헤더 맵 구성
                 let mut header_map = HeaderMap::new();
                 for header in res.headers {
                     if let Ok(value) = std::str::from_utf8(header.value) {
@@ -240,14 +298,12 @@ impl HttpResponseParser {
                     }
                 }
 
-                // 본문 추출 (있는 경우)
                 let body = if self.buf.len() > headers_len {
                     Some(self.buf[headers_len..].to_vec())
                 } else {
                     None
                 };
 
-                // 연결 타입 결정
                 let connection_type = determine_connection_type(&header_map, &version);
 
                 Ok(HttpResponse {
@@ -297,90 +353,8 @@ pub enum ConnectionType {
     WebSocketUpgrade,
 }
 
-/// HTTP 요청 구조체
-#[derive(Debug)]
-pub struct HttpRequest {
-    pub method: String,
-    pub path: String,
-    pub version: String,
-    pub headers: HeaderMap,
-    pub body: Option<Vec<u8>>,
-    pub connection_type: ConnectionType,
-}
-
-impl HttpRequest {
-    /// 웹소켓 업그레이드 요청인지 확인
-    pub fn is_websocket_upgrade(&self) -> bool {
-        let has_upgrade = if let Some(val) = self.headers.get("upgrade") {
-            val.to_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("websocket")
-        } else {
-            false
-        };
-
-        let has_connection_upgrade = if let Some(val) = self.headers.get("connection") {
-            val.to_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("upgrade")
-        } else {
-            false
-        };
-
-        let has_sec_websocket_key = self.headers.contains_key("sec-websocket-key");
-
-        has_upgrade && has_connection_upgrade && has_sec_websocket_key
-    }
-}
-
-/// HTTP 응답 구조체
-#[derive(Debug)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub reason: String,
-    pub version: String,
-    pub headers: HeaderMap,
-    pub body: Option<Vec<u8>>,
-    pub connection_type: ConnectionType,
-}
-
-impl HttpResponse {
-    /// 웹소켓 업그레이드 응답인지 확인
-    pub fn is_websocket_upgrade(&self) -> bool {
-        // 상태 코드가 101이어야 함
-        if self.status != 101 {
-            return false;
-        }
-
-        let has_upgrade = if let Some(val) = self.headers.get("upgrade") {
-            val.to_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("websocket")
-        } else {
-            false
-        };
-
-        let has_connection_upgrade = if let Some(val) = self.headers.get("connection") {
-            val.to_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("upgrade")
-        } else {
-            false
-        };
-
-        let has_sec_websocket_accept = self.headers.contains_key("sec-websocket-accept");
-
-        has_upgrade && has_connection_upgrade && has_sec_websocket_accept
-    }
-}
-
 /// 헤더와 HTTP 버전에 따라 연결 타입 결정
 fn determine_connection_type(headers: &HeaderMap, version: &str) -> ConnectionType {
-    // 웹소켓 업그레이드 확인
     if let Some(upgrade) = headers.get("upgrade") {
         if upgrade
             .to_str()

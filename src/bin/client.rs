@@ -2,20 +2,21 @@ use chrono;
 use clap::Parser;
 use reverse_tcp_proxy::{
     ConnectionType, HttpRequestParser, HttpResponseParser, ProxyConnectionState,
+    is_connection_error,
 };
 use socket2;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
-use tokio::sync::mpsc;
-use std::time::Instant;
-use tokio::sync::Mutex;
-use std::collections::HashMap;
-use std::fmt;
-use std::error::Error;
 
 // Custom error type to work with Send trait
 #[derive(Debug)]
@@ -56,9 +57,13 @@ impl ConnectionPool {
             max_pool_size,
         }
     }
-    
+
     // Get a connection from the pool or create a new one
-    async fn get_connection(&mut self, port: u16, connection_timeout: u64) -> Option<(TcpStream, String)> {
+    async fn get_connection(
+        &mut self,
+        port: u16,
+        connection_timeout: u64,
+    ) -> Option<(TcpStream, String)> {
         // First try to get an existing connection from the pool
         if let Some(conns) = self.connections.get_mut(&port) {
             // Find a connection that might still be valid
@@ -68,39 +73,50 @@ impl ConnectionPool {
                 Instant::now().duration_since(c.last_used) < Duration::from_secs(30)
             }) {
                 let conn = conns.remove(idx);
-                debug!("Reusing pooled connection to backend:{} with session_id {}", port, conn.session_id);
+                debug!(
+                    "Reusing pooled connection to backend:{} with session_id {}",
+                    port, conn.session_id
+                );
                 return Some((conn.stream, conn.session_id));
             }
         }
-        
+
         // If no existing connection is available, create a new one
         match timeout(
             Duration::from_secs(connection_timeout),
             TcpStream::connect(("127.0.0.1", port)),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(stream)) => {
                 // Set TCP_NODELAY to improve latency
                 if let Err(e) = stream.set_nodelay(true) {
                     debug!("Failed to set TCP_NODELAY on new backend stream: {}", e);
                 }
-                
+
                 // Generate a new session ID
                 let session_id = format!("{}-{}", chrono::Utc::now().timestamp_millis(), port);
-                debug!("Created new connection to backend:{} with session_id {}", port, session_id);
+                debug!(
+                    "Created new connection to backend:{} with session_id {}",
+                    port, session_id
+                );
                 Some((stream, session_id))
-            },
-            _ => None
+            }
+            _ => None,
         }
     }
-    
+
     // Return a connection to the pool for reuse
     async fn return_connection(&mut self, port: u16, stream: TcpStream, session_id: String) {
         // Check if this port already has a pool
         let conns = self.connections.entry(port).or_insert_with(Vec::new);
-        
+
         // If the pool isn't full, add the connection
         if conns.len() < self.max_pool_size {
-            debug!("Returning connection with session_id {} to pool for backend:{}", session_id, port);
+            debug!(
+                "Returning connection with session_id {} to pool for backend:{}",
+                session_id, port
+            );
             conns.push(PooledConnection {
                 stream,
                 last_used: Instant::now(),
@@ -109,11 +125,11 @@ impl ConnectionPool {
         }
         // Otherwise, the connection will be dropped and closed
     }
-    
+
     // Clean up idle connections
     async fn cleanup(&mut self) {
         let now = Instant::now();
-        
+
         // For each port in the pool
         let ports_to_check: Vec<u16> = self.connections.keys().cloned().collect();
         for port in ports_to_check {
@@ -122,11 +138,14 @@ impl ConnectionPool {
                 conns.retain(|conn| {
                     let should_keep = now.duration_since(conn.last_used) < self.max_idle_time;
                     if !should_keep {
-                        debug!("Removing idle connection with session_id {} from pool", conn.session_id);
+                        debug!(
+                            "Removing idle connection with session_id {} from pool",
+                            conn.session_id
+                        );
                     }
                     should_keep
                 });
-                
+
                 // If the pool for this port is empty, remove it
                 if conns.is_empty() {
                     self.connections.remove(&port);
@@ -169,36 +188,22 @@ struct Args {
     /// 재연결 시도 횟수 제한
     #[arg(long = "max-reconnect", short = 'm', default_value = "0")]
     max_reconnect_attempts: u32,
-    
+
     /// 데이터 로깅 레벨
     #[arg(long = "data-logging", short = 'd', default_value = "off")]
     data_logging: String,
-    
+
     /// 연결 풀 최대 크기
     #[arg(long = "max-pool-size", default_value = "10")]
     max_pool_size: usize,
-    
+
     /// 연결 풀 최대 유휴 시간 (초)
     #[arg(long = "pool-idle-timeout", default_value = "300")]
     pool_idle_timeout: u64,
-    
+
     /// 연결 풀 활성화 여부
     #[arg(long = "use-connection-pool", default_value = "false")]
     use_connection_pool: bool,
-}
-
-/// 웹소켓 업그레이드 응답인지 확인하는 함수
-fn is_websocket_upgrade_response(data: &[u8]) -> bool {
-    let mut parser = HttpResponseParser::new();
-    parser.extend(data);
-    parser.is_websocket_upgrade()
-}
-
-/// 웹소켓 업그레이드 요청인지 확인하는 함수
-fn is_websocket_request(data: &[u8]) -> bool {
-    let mut parser = HttpRequestParser::new();
-    parser.extend(data);
-    parser.is_websocket_upgrade()
 }
 
 /// 서버로 부터 받은 데이터를 백엔드로 릴레이 하는 함수
@@ -213,7 +218,7 @@ async fn handle_backend_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send>> {
     // 연결 상태
     let mut connection_state = ProxyConnectionState::Initial;
-    
+
     // Try to get a connection from the pool
     let (mut backend_stream, connection_id) = {
         let mut pool = pool.lock().await;
@@ -224,9 +229,12 @@ async fn handle_backend_connection(
             return Err(proxy_err("Failed to connect to backend"));
         }
     };
-    
-    info!("Using connection {} to backend:{}", connection_id, backend_port);
-    
+
+    info!(
+        "Using connection {} to backend:{}",
+        connection_id, backend_port
+    );
+
     // Track if this connection is HTTP and keep-alive for potential reuse
     let mut is_http = false;
     let mut is_keep_alive = true;
@@ -245,22 +253,26 @@ async fn handle_backend_connection(
 
     // Configure socket buffer sizes - 소켓 버퍼 크기 증가
     let socket_ref = socket2::SockRef::from(&server_stream);
-    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) { // 1MB
+    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) {
+        // 1MB
         debug!("Failed to set receive buffer size on server stream: {}", e);
     }
-    if let Err(e) = socket_ref.set_send_buffer_size(1048576) { // 1MB
+    if let Err(e) = socket_ref.set_send_buffer_size(1048576) {
+        // 1MB
         debug!("Failed to set send buffer size on server stream: {}", e);
     }
 
     // Connection pool may have already set these, but let's ensure they're set
     let socket_ref = socket2::SockRef::from(&backend_stream);
-    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) { // 1MB
+    if let Err(e) = socket_ref.set_recv_buffer_size(1048576) {
+        // 1MB
         debug!("Failed to set receive buffer size on backend stream: {}", e);
     }
-    if let Err(e) = socket_ref.set_send_buffer_size(1048576) { // 1MB
+    if let Err(e) = socket_ref.set_send_buffer_size(1048576) {
+        // 1MB
         debug!("Failed to set send buffer size on backend stream: {}", e);
     }
-    
+
     // 소켓 연결 상태 확인 로깅
     if let Ok(info) = server_stream.peer_addr() {
         debug!("Server stream connected to {}", info);
@@ -279,18 +291,14 @@ async fn handle_backend_connection(
         }
     };
 
-    // Process initial data if we received any
     if n > 0 {
-        // 초기 데이터를 잘라서 실제 받은 부분만 사용
         initial_data.truncate(n);
 
-        // HTTP 요청 파싱 및 연결 유형 결정
         let mut request_parser = HttpRequestParser::new();
         request_parser.extend(&initial_data);
 
         let mut is_websocket_req = false;
 
-        // HTTP 요청인지 확인하고 파싱
         if request_parser.is_complete() {
             if let Ok(request) = request_parser.parse() {
                 is_http = true;
@@ -323,17 +331,14 @@ async fn handle_backend_connection(
             }
         }
 
-        // 백업: 이전 메서드로도 웹소켓 확인
-        if !is_websocket_req && is_websocket_request(&initial_data) {
+        if !is_websocket_req && request_parser.is_websocket_upgrade() {
             is_websocket_req = true;
             connection_state = ProxyConnectionState::WebSocket;
             info!("Backup detection: WebSocket upgrade request detected");
         }
 
-        // 디버깅 정보 로깅
         match std::str::from_utf8(&initial_data) {
             Ok(s) => {
-                // Log the first line or up to 100 chars to avoid cluttering logs
                 let preview = s
                     .lines()
                     .next()
@@ -359,17 +364,14 @@ async fn handle_backend_connection(
             ),
         }
 
-        // Forward initial data to backend
         if let Err(e) = backend_stream.write_all(&initial_data).await {
             error!("Error sending initial data to backend: {}", e);
             return Err(proxy_err(e.to_string()));
         }
 
-        // Check if this might be a WebSocket upgrade request
         if is_websocket_req {
             info!("WebSocket upgrade request detected, waiting for backend response");
 
-            // Read the backend's response to see if it's a valid WebSocket upgrade response
             let mut response_buffer = vec![0u8; 8192];
             match timeout(
                 Duration::from_secs(connection_timeout),
@@ -378,16 +380,13 @@ async fn handle_backend_connection(
             .await
             {
                 Ok(Ok(n)) if n > 0 => {
-                    // 실제 받은 데이터만 사용
                     response_buffer.truncate(n);
 
-                    // Forward the response to the server first
                     if let Err(e) = server_stream.write_all(&response_buffer).await {
                         error!("Error forwarding WebSocket response to server: {}", e);
                         return Err(proxy_err(e.to_string()));
                     }
 
-                    // HTTP 응답 파싱 및 웹소켓 업그레이드 확인
                     let mut response_parser = HttpResponseParser::new();
                     response_parser.extend(&response_buffer);
 
@@ -398,11 +397,9 @@ async fn handle_backend_connection(
                             false
                         }
                     } else {
-                        // 파서로 확인 실패 시 기존 방식으로 확인
-                        is_websocket_upgrade_response(&response_buffer)
+                        response_parser.is_websocket_upgrade()
                     };
 
-                    // Check if it's a valid WebSocket response
                     if is_valid_websocket {
                         info!("Backend confirmed WebSocket upgrade, switching to WebSocket mode");
                         connection_state = ProxyConnectionState::WebSocket;
@@ -416,17 +413,18 @@ async fn handle_backend_connection(
                 }
                 _ => {
                     error!("Failed to get backend response for WebSocket upgrade");
-                    return Err(proxy_err("Failed to get backend response for WebSocket upgrade"));
+                    return Err(proxy_err(
+                        "Failed to get backend response for WebSocket upgrade",
+                    ));
                 }
             }
         }
 
-        // For HTTP requests that specifically request connection close, we should handle them differently
         if is_http && is_connection_close {
             info!(
                 "HTTP request with Connection: close detected, will close connection after response"
             );
-            // Use special handling for Connection: close requests
+
             handle_one_time_http_request(server_stream, backend_stream).await?;
             return Ok(());
         }
@@ -434,7 +432,7 @@ async fn handle_backend_connection(
         // No initial data received, just a notification of connection
         debug!("No initial data received from server");
     }
-    
+
     // Use tokio::io::split to get owned halves for async tasks
     let (mut sr, mut sw) = tokio::io::split(server_stream);
     let (mut br, mut bw) = tokio::io::split(backend_stream);
@@ -446,7 +444,7 @@ async fn handle_backend_connection(
         None
     };
 
-    // Create channels for signaling completion 
+    // Create channels for signaling completion
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<(bool, bool)>();
     let completion_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(completion_tx)));
 
@@ -464,7 +462,7 @@ async fn handle_backend_connection(
     let connection_id_clone = connection_id.clone();
     let pool_clone = pool.clone();
     let backend_port_clone = backend_port;
-    
+
     // Store connection type flags for later use in reuse decision
     let is_http_clone = is_http;
     let is_keep_alive_clone = is_keep_alive;
@@ -474,7 +472,7 @@ async fn handle_backend_connection(
     let backend_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_error_clone = server_error.clone();
     let backend_error_clone = backend_error.clone();
-    
+
     // Clone them again for our main task
     let server_error_main = server_error.clone();
     let backend_error_main = backend_error.clone();
@@ -502,12 +500,17 @@ async fn handle_backend_connection(
                                 server_error.store(true, std::sync::atomic::Ordering::SeqCst);
                                 break;
                             }
-                            
+
                             total_bytes += n as u64;
-                            total_sent_clone.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                            total_sent_clone
+                                .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
                             debug!("server -> backend: {} bytes transferred", n);
-                            if total_bytes > 100_000_000 { // 100MB 이상 전송 시 경고
-                                warn!("Large data transfer: server -> backend: {} bytes total", total_bytes);
+                            if total_bytes > 100_000_000 {
+                                // 100MB 이상 전송 시 경고
+                                warn!(
+                                    "Large data transfer: server -> backend: {} bytes total",
+                                    total_bytes
+                                );
                             }
                         }
                         Err(e) => {
@@ -543,8 +546,12 @@ async fn handle_backend_connection(
             // No timeout - use standard copy function with debug
             let result = tokio::io::copy(&mut sr, &mut bw).await;
             if let Ok(bytes) = result {
-                if bytes > 100_000_000 { // 100MB 이상 전송 시 경고
-                    warn!("Large data transfer without timeout: server -> backend: {} bytes", bytes);
+                if bytes > 100_000_000 {
+                    // 100MB 이상 전송 시 경고
+                    warn!(
+                        "Large data transfer without timeout: server -> backend: {} bytes",
+                        bytes
+                    );
                 }
             }
             result
@@ -589,23 +596,31 @@ async fn handle_backend_connection(
                                 // 데이터 즉시 플러시 추가
                                 if let Err(e) = sw.flush().await {
                                     error!("Error flushing data to server: {}", e);
-                                    backend_error_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    backend_error_clone
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
                                     break;
                                 }
-                                
+
                                 total_bytes += n as u64;
-                                total_received_clone.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                                total_received_clone
+                                    .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
                                 debug!("backend -> server: {} bytes transferred", n);
 
                                 // 첫 100바이트 데이터 로깅 (트러블슈팅용)
                                 if n > 10 && total_bytes < 10000 {
-                                    info!("Data sample (backend -> server): {:?}", &buffer[..std::cmp::min(n, 100)]);
+                                    info!(
+                                        "Data sample (backend -> server): {:?}",
+                                        &buffer[..std::cmp::min(n, 100)]
+                                    );
                                 }
-                                
+
                                 if total_bytes > 100_000_000 {
-                                    warn!("Large data transfer: backend -> server: {} bytes total", total_bytes);
+                                    warn!(
+                                        "Large data transfer: backend -> server: {} bytes total",
+                                        total_bytes
+                                    );
                                 }
-                                
+
                                 // 대용량 패킷 전송 시 일시적 스레드 양보
                                 if n > 100000 {
                                     tokio::task::yield_now().await;
@@ -645,7 +660,7 @@ async fn handle_backend_connection(
             // No timeout - use standard copy with logging
             let mut buffer = [0u8; 32768];
             let mut total_bytes: u64 = 0;
-            
+
             loop {
                 match br.read(&mut buffer).await {
                     Ok(0) => break, // EOF
@@ -655,23 +670,31 @@ async fn handle_backend_connection(
                                 // 플러시 명시적 호출
                                 if let Err(e) = sw.flush().await {
                                     error!("Error flushing data to server: {}", e);
-                                    server_error_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    server_error_clone
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
                                     break;
                                 }
-                                
+
                                 total_bytes += n as u64;
-                                total_received_clone.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                                total_received_clone
+                                    .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
                                 debug!("backend -> server: {} bytes transferred", n);
-                                
+
                                 // 첫 100바이트 데이터 로깅 (트러블슈팅용)
                                 if n > 10 && total_bytes < 10000 {
-                                    info!("Data sample (backend -> server): {:?}", &buffer[..std::cmp::min(n, 100)]);
+                                    info!(
+                                        "Data sample (backend -> server): {:?}",
+                                        &buffer[..std::cmp::min(n, 100)]
+                                    );
                                 }
-                                
+
                                 if total_bytes > 100_000_000 {
-                                    warn!("Large data transfer: backend -> server: {} bytes total", total_bytes);
+                                    warn!(
+                                        "Large data transfer: backend -> server: {} bytes total",
+                                        total_bytes
+                                    );
                                 }
-                                
+
                                 // 대용량 패킷 전송 시 일시적 스레드 양보
                                 if n > 100000 {
                                     tokio::task::yield_now().await;
@@ -699,7 +722,7 @@ async fn handle_backend_connection(
                     }
                 }
             }
-            
+
             Ok(total_bytes)
         };
 
@@ -729,59 +752,80 @@ async fn handle_backend_connection(
             // Channel error, assume both sides done
             error!("Channel error while waiting for completion");
             (true, true)
-        },
+        }
     };
 
     // Ensure both tasks complete before we try to reassemble the stream
     let _ = to_backend.await;
     let _ = to_server.await;
-    
+
     // 전송 통계 기록
     let total_sent_final = total_sent.load(std::sync::atomic::Ordering::SeqCst);
     let total_received_final = total_received.load(std::sync::atomic::Ordering::SeqCst);
-    
-    info!("Proxy session completed: sent {} bytes, received {} bytes", 
-        total_sent_final, total_received_final);
+
+    info!(
+        "Proxy session completed: sent {} bytes, received {} bytes",
+        total_sent_final, total_received_final
+    );
 
     // Now attempt to reassemble the backend stream for reuse
     // This is a tricky part - we need to reconnect the two halves
     let server_error_val = server_error_main.load(std::sync::atomic::Ordering::SeqCst);
     let backend_error_val = backend_error_main.load(std::sync::atomic::Ordering::SeqCst);
-    
+
     // Determine if the connection can be reused
     let can_reuse = is_http_clone && is_keep_alive_clone && !server_error_val && !backend_error_val;
-    
+
     if can_reuse {
         // Try to manually recreate the stream using AsyncRead + AsyncWrite traits
         // Unfortunately, in tokio there's no direct split_reunite API, so we need an alternative approach
         // Option 1: Create a new connection to replace the split one
         match TcpStream::connect(("127.0.0.1", backend_port_clone)).await {
             Ok(fresh_stream) => {
-                info!("Created fresh connection to replace {} for backend:{}", connection_id_clone, backend_port_clone);
+                info!(
+                    "Created fresh connection to replace {} for backend:{}",
+                    connection_id_clone, backend_port_clone
+                );
                 let mut pool = pool_clone.lock().await;
                 // Generate a new session ID for the fresh connection
-                let new_session_id = format!("{}-{}", chrono::Utc::now().timestamp_millis(), backend_port_clone);
-                pool.return_connection(backend_port_clone, fresh_stream, new_session_id).await;
-            },
+                let new_session_id = format!(
+                    "{}-{}",
+                    chrono::Utc::now().timestamp_millis(),
+                    backend_port_clone
+                );
+                pool.return_connection(backend_port_clone, fresh_stream, new_session_id)
+                    .await;
+            }
             Err(e) => {
-                info!("Could not create replacement connection for {}: {}", connection_id_clone, e);
+                info!(
+                    "Could not create replacement connection for {}: {}",
+                    connection_id_clone, e
+                );
             }
         }
     } else {
         if server_error_val || backend_error_val {
-            info!("Not returning connection {} to pool due to errors", connection_id_clone);
+            info!(
+                "Not returning connection {} to pool due to errors",
+                connection_id_clone
+            );
         } else if !is_keep_alive_clone {
-            info!("Not returning connection {} to pool as it's not keep-alive", connection_id_clone);
+            info!(
+                "Not returning connection {} to pool as it's not keep-alive",
+                connection_id_clone
+            );
         }
     }
 
     info!("Proxy session streams closed by task completion");
-    
+
     Ok(())
 }
 
-// Handle a one-time HTTP request that should close after completion
-async fn handle_one_time_http_request(mut server_stream: TcpStream, mut backend_stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send>> {
+async fn handle_one_time_http_request(
+    mut server_stream: TcpStream,
+    mut backend_stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
     debug!("Handling one-time HTTP request with Connection: close");
 
     // HTTP 응답 파서 초기화
@@ -816,7 +860,7 @@ async fn handle_one_time_http_request(mut server_stream: TcpStream, mut backend_
                     error!("Error sending response to server: {}", e);
                     return Ok(());
                 }
-                
+
                 // 명시적 플러시 추가
                 if let Err(e) = server_stream.flush().await {
                     error!("Error flushing response to server: {}", e);
@@ -935,14 +979,22 @@ async fn handle_one_time_http_request(mut server_stream: TcpStream, mut backend_
                                 response_parser.extend(&response_buffer[buf_pos..]);
 
                                 // Forward the additional data
-                                if let Err(e) = server_stream.write_all(&response_buffer[buf_pos..]).await {
-                                    error!("Error sending additional response data to server: {}", e);
+                                if let Err(e) =
+                                    server_stream.write_all(&response_buffer[buf_pos..]).await
+                                {
+                                    error!(
+                                        "Error sending additional response data to server: {}",
+                                        e
+                                    );
                                     break;
                                 }
-                                
+
                                 // 명시적 플러시 추가
                                 if let Err(e) = server_stream.flush().await {
-                                    error!("Error flushing additional response data to server: {}", e);
+                                    error!(
+                                        "Error flushing additional response data to server: {}",
+                                        e
+                                    );
                                     break;
                                 }
 
@@ -1015,7 +1067,10 @@ async fn handle_one_time_http_request(mut server_stream: TcpStream, mut backend_
 }
 
 // Handle WebSocket connection with special handling
-async fn handle_websocket_connection(server_stream: TcpStream, backend_stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send>> {
+async fn handle_websocket_connection(
+    server_stream: TcpStream,
+    backend_stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
     debug!("Starting WebSocket proxy mode between server and backend");
 
     // Use the split function to get owned halves for async tasks
@@ -1048,7 +1103,7 @@ async fn handle_websocket_connection(server_stream: TcpStream, backend_stream: T
                                 error!("WebSocket: Error flushing data to backend: {}", e);
                                 break;
                             }
-                            
+
                             total_bytes += n as u64;
                             debug!("WebSocket: server -> backend: {} bytes transferred", n);
                             if total_bytes % 10240 == 0 {
@@ -1106,7 +1161,7 @@ async fn handle_websocket_connection(server_stream: TcpStream, backend_stream: T
                                 error!("WebSocket: Error flushing data to server: {}", e);
                                 break;
                             }
-                            
+
                             total_bytes += n as u64;
                             debug!("WebSocket: backend -> server: {} bytes transferred", n);
                             if total_bytes % 10240 == 0 {
@@ -1116,10 +1171,13 @@ async fn handle_websocket_connection(server_stream: TcpStream, backend_stream: T
                                     total_bytes
                                 );
                             }
-                            
+
                             // 대용량 데이터 전송 시 경고 로그 추가
                             if total_bytes > 100000 && total_bytes % 100000 < 10240 {
-                                warn!("WebSocket: Large data transfer: backend -> server: {} bytes total", total_bytes);
+                                warn!(
+                                    "WebSocket: Large data transfer: backend -> server: {} bytes total",
+                                    total_bytes
+                                );
                             }
                         }
                         Err(e) => {
@@ -1161,10 +1219,10 @@ async fn handle_websocket_connection(server_stream: TcpStream, backend_stream: T
 async fn main() {
     // Setup tracing subscriber for logs
     tracing_subscriber::fmt::init();
-    
+
     // Parse command line arguments
     let args = Args::parse();
-    
+
     // Log startup information
     info!("Starting reverse TCP proxy client");
     info!(
@@ -1172,29 +1230,29 @@ async fn main() {
         args.server, args.backend_port, args.public_port
     );
     info!(
-        "Timeouts - Connection: {}s, Idle: {}s", 
+        "Timeouts - Connection: {}s, Idle: {}s",
         args.connection_timeout, args.idle_timeout
     );
-    
+
     // Log connection pool settings
     info!(
         "Connection Pool - Max Size: {}, Idle Timeout: {}s",
         args.max_pool_size, args.pool_idle_timeout
     );
-    
+
     // Log data logging level
     info!("Data logging level: {}", args.data_logging);
-    
+
     // Setup signal handler for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        
+
         tokio::spawn(async move {
             tokio::select! {
                 _ = sigint.recv() => {
@@ -1232,7 +1290,7 @@ async fn main() {
                 if let Ok(output) = Command::new("sh")
                     .arg("-c")
                     .arg("cat /proc/self/status | grep -E 'VmRSS|FDSize'")
-                    .output() 
+                    .output()
                 {
                     if let Ok(status) = String::from_utf8(output.stdout) {
                         info!("System status: {}", status.trim().replace("\n", ", "));
@@ -1297,7 +1355,7 @@ async fn main() {
             error!("Reconnection disabled, exiting");
             break;
         }
-        
+
         info!("Reconnecting in {} seconds...", backoff_time);
         for _ in 0..backoff_time as usize {
             if !running.load(Ordering::SeqCst) {
@@ -1316,7 +1374,10 @@ async fn main() {
 }
 
 // The main connection and serving logic extracted from main
-async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error + Send>> {
+async fn connect_and_serve(
+    args: &Args,
+    running: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
     info!(
         "Connecting to server {} for backend port {} (public port {})",
         args.server, args.backend_port, args.public_port
@@ -1325,12 +1386,15 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
     // Create connection pool if enabled
     let pool = Arc::new(Mutex::new(ConnectionPool::new(
         args.pool_idle_timeout,
-        args.max_pool_size
+        args.max_pool_size,
     )));
-    
+
     // Start connection pool cleanup task if needed
     if args.use_connection_pool {
-        info!("Using connection pool with max size: {}", args.max_pool_size);
+        info!(
+            "Using connection pool with max size: {}",
+            args.max_pool_size
+        );
         let pool_clone = pool.clone();
         tokio::spawn(async move {
             loop {
@@ -1370,15 +1434,24 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
     // Register with the server using the provided backend and public ports
     let register_msg = format!("REGISTER {} {}\n", args.backend_port, args.public_port);
     if let Err(e) = control_stream.write_all(register_msg.as_bytes()).await {
-        return Err(proxy_err(format!("Failed to send registration message: {}", e)));
+        return Err(proxy_err(format!(
+            "Failed to send registration message: {}",
+            e
+        )));
     }
 
     // 등록 메시지 플러시 강제화
     if let Err(e) = control_stream.flush().await {
-        return Err(proxy_err(format!("Failed to flush registration message: {}", e)));
+        return Err(proxy_err(format!(
+            "Failed to flush registration message: {}",
+            e
+        )));
     }
 
-    info!("Registered backend:{} as public:{}", args.backend_port, args.public_port);
+    info!(
+        "Registered backend:{} as public:{}",
+        args.backend_port, args.public_port
+    );
 
     // 서버가 등록을 처리할 수 있도록 잠시 지연
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1388,11 +1461,11 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
     // Track active sessions to avoid race conditions during quick refreshes
     let active_sessions_arc = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let active_sessions_timer = active_sessions_arc.clone();
-    
+
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            
+
             let mut sessions = active_sessions_timer.lock().await;
             let old_count = sessions.len();
             if old_count > 10 {
@@ -1403,9 +1476,9 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
             }
         }
     });
-    
+
     let active_sessions = active_sessions_arc.clone();
-    
+
     // Connection pool management to reduce connection setup time
     let mut last_connection_time = std::time::Instant::now();
 
@@ -1426,9 +1499,12 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
 
                     // Wait for CONNECT after READY
                     let mut connect_line = String::new();
-                    match timeout(Duration::from_secs(1), reader.read_line(&mut connect_line)).await {
+                    match timeout(Duration::from_secs(1), reader.read_line(&mut connect_line)).await
+                    {
                         Ok(Ok(0)) => {
-                            return Err(proxy_err("Server closed connection while waiting for CONNECT"));
+                            return Err(proxy_err(
+                                "Server closed connection while waiting for CONNECT",
+                            ));
                         }
                         Ok(Ok(_)) => {
                             let connect_trimmed = connect_line.trim();
@@ -1452,7 +1528,7 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
                                         let sessions = active_sessions.lock().await;
                                         sessions.len()
                                     };
-                                    
+
                                     if session_count >= 100 {
                                         warn!(
                                             "Too many active sessions ({}), cleaning up old ones",
@@ -1524,7 +1600,10 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
 
                                             // 콜백 데이터를 서버에 플러시 추가
                                             if let Err(e) = server_stream.flush().await {
-                                                error!("Failed to flush handshake ID to server: {}", e);
+                                                error!(
+                                                    "Failed to flush handshake ID to server: {}",
+                                                    e
+                                                );
                                                 continue;
                                             }
 
@@ -1539,13 +1618,13 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
                                             let pool_for_task = pool.clone();
                                             let data_logging_clone = args.data_logging.clone();
                                             let use_connection_pool = args.use_connection_pool;
-                                            
+
                                             tokio::spawn(async move {
                                                 info!(
                                                     "Session {}: Proxy session established with backend:{}",
                                                     session_id, backend_port
                                                 );
-                                                
+
                                                 if use_connection_pool {
                                                     // Use connection pool for backend connections
                                                     if let Err(e) = handle_backend_connection(
@@ -1556,59 +1635,106 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
                                                         pool_for_task,
                                                         data_logging_clone,
                                                         Some(active_sessions_clone.clone()),
-                                                    ).await {
+                                                    )
+                                                    .await
+                                                    {
                                                         error!("Error in proxy session: {}", e);
                                                     }
                                                 } else {
                                                     // Legacy mode: Direct connection without pool
                                                     match timeout(
                                                         Duration::from_secs(connection_timeout),
-                                                        TcpStream::connect(("127.0.0.1", backend_port)),
-                                                    ).await {
+                                                        TcpStream::connect((
+                                                            "127.0.0.1",
+                                                            backend_port,
+                                                        )),
+                                                    )
+                                                    .await
+                                                    {
                                                         Ok(Ok(mut backend_stream)) => {
                                                             // Configure socket options
-                                                            if let Err(e) = backend_stream.set_nodelay(true) {
-                                                                debug!("Failed to set TCP_NODELAY on backend stream: {}", e);
+                                                            if let Err(e) =
+                                                                backend_stream.set_nodelay(true)
+                                                            {
+                                                                debug!(
+                                                                    "Failed to set TCP_NODELAY on backend stream: {}",
+                                                                    e
+                                                                );
                                                             }
-                                                            
-                                                            let socket_ref = socket2::SockRef::from(&backend_stream);
-                                                            if let Err(e) = socket_ref.set_keepalive(true) {
-                                                                debug!("Failed to set SO_KEEPALIVE on backend stream: {}", e);
+
+                                                            let socket_ref = socket2::SockRef::from(
+                                                                &backend_stream,
+                                                            );
+                                                            if let Err(e) =
+                                                                socket_ref.set_keepalive(true)
+                                                            {
+                                                                debug!(
+                                                                    "Failed to set SO_KEEPALIVE on backend stream: {}",
+                                                                    e
+                                                                );
                                                             }
-                                                            
-                                                            if let Err(e) = socket_ref.set_recv_buffer_size(1048576) { // 1MB
-                                                                debug!("Failed to set receive buffer size on backend stream: {}", e);
+
+                                                            if let Err(e) = socket_ref
+                                                                .set_recv_buffer_size(1048576)
+                                                            {
+                                                                // 1MB
+                                                                debug!(
+                                                                    "Failed to set receive buffer size on backend stream: {}",
+                                                                    e
+                                                                );
                                                             }
-                                                            if let Err(e) = socket_ref.set_send_buffer_size(1048576) { // 1MB
-                                                                debug!("Failed to set send buffer size on backend stream: {}", e);
+                                                            if let Err(e) = socket_ref
+                                                                .set_send_buffer_size(1048576)
+                                                            {
+                                                                // 1MB
+                                                                debug!(
+                                                                    "Failed to set send buffer size on backend stream: {}",
+                                                                    e
+                                                                );
                                                             }
-                                                            
+
                                                             // Generate legacy-style connection ID
-                                                            let connection_id = format!("{}-{}", chrono::Utc::now().timestamp_millis(), backend_port);
-                                                            
-                                                            info!("Starting connection {} to backend:{}", connection_id, backend_port);
-                                                            
+                                                            let connection_id = format!(
+                                                                "{}-{}",
+                                                                chrono::Utc::now()
+                                                                    .timestamp_millis(),
+                                                                backend_port
+                                                            );
+
+                                                            info!(
+                                                                "Starting connection {} to backend:{}",
+                                                                connection_id, backend_port
+                                                            );
+
                                                             // Process session directly
                                                             handle_legacy_connection(
-                                                                server_stream, 
-                                                                backend_stream, 
+                                                                server_stream,
+                                                                backend_stream,
                                                                 connection_id,
-                                                                data_logging_clone, 
-                                                                idle_timeout
-                                                            ).await;
-                                                        },
+                                                                data_logging_clone,
+                                                                idle_timeout,
+                                                            )
+                                                            .await;
+                                                        }
                                                         Ok(Err(e)) => {
-                                                            error!("Failed to connect to backend: {}", e);
-                                                        },
+                                                            error!(
+                                                                "Failed to connect to backend: {}",
+                                                                e
+                                                            );
+                                                        }
                                                         Err(_) => {
-                                                            error!("Connection timeout while connecting to backend:{}", backend_port);
+                                                            error!(
+                                                                "Connection timeout while connecting to backend:{}",
+                                                                backend_port
+                                                            );
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // Remove from active sessions when done
                                                 {
-                                                    let mut sessions = active_sessions_clone.lock().await;
+                                                    let mut sessions =
+                                                        active_sessions_clone.lock().await;
                                                     sessions.remove(&handshake_id_clone);
                                                     debug!(
                                                         "Removed session {} from active sessions, {} remain",
@@ -1617,12 +1743,18 @@ async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> Result<(), 
                                                     );
                                                 }
                                             });
-                                        },
+                                        }
                                         Ok(Err(e)) => {
-                                            error!("Session {}: Failed to connect back to server: {}", session_id, e);
-                                        },
+                                            error!(
+                                                "Session {}: Failed to connect back to server: {}",
+                                                session_id, e
+                                            );
+                                        }
                                         Err(_) => {
-                                            error!("Session {}: Connection timeout while connecting back to server", session_id);
+                                            error!(
+                                                "Session {}: Connection timeout while connecting back to server",
+                                                session_id
+                                            );
                                         }
                                     }
                                 }
@@ -1678,80 +1810,92 @@ async fn handle_legacy_connection(
             return;
         }
     };
-    
+
     // Process initial data if we received any
     if n > 0 {
         // Truncate to actual received data
         initial_data.truncate(n);
-        
+
         // Log initial data based on logging level
         match data_logging.as_str() {
             "minimal" => {
                 debug!("Server → Backend: {} bytes", n);
-            },
+            }
             "verbose" => {
-                debug!("Server → Backend [{}]: {} bytes\n{:?}", 
-                    connection_id, n, 
-                    String::from_utf8_lossy(&initial_data[..std::cmp::min(n, 100)]));
-            },
+                debug!(
+                    "Server → Backend [{}]: {} bytes\n{:?}",
+                    connection_id,
+                    n,
+                    String::from_utf8_lossy(&initial_data[..std::cmp::min(n, 100)])
+                );
+            }
             _ => {}
         }
-        
+
         // Forward initial data to backend
         if let Err(e) = backend_stream.write_all(&initial_data).await {
             error!("Error sending initial data to backend: {}", e);
             return;
         }
-        
+
         // Flush the write
         if let Err(e) = backend_stream.flush().await {
             error!("Error flushing initial data to backend: {}", e);
             return;
         }
     }
-    
+
     // Parse the HTTP request to determine connection type
     let mut connection_state = ProxyConnectionState::Initial;
     let mut is_http = false;
     let mut is_websocket = false;
     let mut is_keep_alive = true;
     let mut is_connection_close = false;
-    
+
     // Check if it's an HTTP request and determine connection type
     let mut request_parser = HttpRequestParser::new();
     request_parser.extend(&initial_data);
-    
+
     if request_parser.is_complete() {
         if let Ok(request) = request_parser.parse() {
             is_http = true;
-            
+
             match request.connection_type {
                 ConnectionType::KeepAlive => {
                     is_keep_alive = true;
                     is_connection_close = false;
                     connection_state = ProxyConnectionState::Active;
-                    info!("Detected HTTP keep-alive request for path: {}", request.path);
+                    info!(
+                        "Detected HTTP keep-alive request for path: {}",
+                        request.path
+                    );
                 }
                 ConnectionType::Close => {
                     is_keep_alive = false;
                     is_connection_close = true;
                     connection_state = ProxyConnectionState::FirstExchange;
-                    info!("Detected HTTP connection: close request for path: {}", request.path);
+                    info!(
+                        "Detected HTTP connection: close request for path: {}",
+                        request.path
+                    );
                 }
                 ConnectionType::WebSocketUpgrade => {
                     is_websocket = true;
                     connection_state = ProxyConnectionState::WebSocket;
-                    info!("Detected WebSocket upgrade request for path: {}", request.path);
+                    info!(
+                        "Detected WebSocket upgrade request for path: {}",
+                        request.path
+                    );
                 }
             }
-            
+
             info!(
                 "Detected HTTP request for path: {}, connection-type: {:?}",
                 request.path, request.connection_type
             );
         }
     }
-    
+
     // Handle based on connection type
     if is_websocket {
         info!("Handling WebSocket upgrade request");
@@ -1767,10 +1911,10 @@ async fn handle_legacy_connection(
         // Regular bidirectional proxy
         // Set up buffer sizes for the streams
         const BUFFER_SIZE: usize = 32 * 1024; // 32KB buffer
-        
+
         let (mut server_read, mut server_write) = tokio::io::split(server_stream);
         let (mut backend_read, mut backend_write) = tokio::io::split(backend_stream);
-        
+
         // Start a timer for idle timeout if applicable
         let start_time = Instant::now();
         let idle_duration = if idle_timeout > 0 {
@@ -1778,39 +1922,39 @@ async fn handle_legacy_connection(
         } else {
             None
         };
-        
+
         // Create tasks for bidirectional data transfer
         let mut server_to_backend_buffer = vec![0u8; BUFFER_SIZE];
         let mut backend_to_server_buffer = vec![0u8; BUFFER_SIZE];
-        
+
         // For HTTP keep-alive connections, we need to monitor for complete requests/responses
         let is_keep_alive_http = is_http && is_keep_alive;
         let http_state = Arc::new(Mutex::new(ProxyConnectionState::Active));
         let http_state_clone = http_state.clone();
-        
+
         // Create a channel for communication between tasks
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let stop_tx_clone = stop_tx.clone();
-        
+
         let data_logging_clone = data_logging.clone();
         let connection_id_for_client = connection_id.clone();
         let connection_id_for_summary = connection_id.clone();
-        
+
         // Track transfer statistics in shared state that can be accessed by both tasks
         let total_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let total_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let total_sent_clone = total_sent.clone();
         let total_received_clone = total_received.clone();
-        
+
         // Server to backend task
         let server_to_backend = tokio::spawn(async move {
             let mut last_log_time = Instant::now();
             let mut bytes_since_last_log = 0u64;
-            
+
             // HTTP request state tracking
             let mut request_data = Vec::new(); // Buffer to collect partial HTTP requests
             let mut awaiting_request = is_keep_alive_http; // Start waiting for request for keep-alive HTTP
-            
+
             loop {
                 match server_read.read(&mut server_to_backend_buffer).await {
                     Ok(0) => {
@@ -1822,65 +1966,82 @@ async fn handle_legacy_connection(
                         if is_keep_alive_http {
                             // Append to our HTTP buffer
                             request_data.extend_from_slice(&server_to_backend_buffer[..n]);
-                            
+
                             // Try to parse as an HTTP request
                             let mut parser = HttpRequestParser::new();
                             parser.extend(&request_data);
-                            
+
                             if parser.is_complete() {
                                 // We have a complete HTTP request
                                 debug!("Complete HTTP request detected");
                                 awaiting_request = false;
-                                
+
                                 if let Ok(request) = parser.parse() {
-                                    debug!("HTTP request parsed: {} {}", request.method, request.path);
-                                    
+                                    debug!(
+                                        "HTTP request parsed: {} {}",
+                                        request.method, request.path
+                                    );
+
                                     // Update connection state based on this request
                                     if request.connection_type == ConnectionType::Close {
                                         let mut state = http_state.lock().await;
                                         *state = ProxyConnectionState::FirstExchange;
-                                        debug!("Connection: close detected, will terminate after response");
+                                        debug!(
+                                            "Connection: close detected, will terminate after response"
+                                        );
                                     }
                                 }
-                                
+
                                 // Clear buffer since we've handled this request
                                 request_data.clear();
                             }
                         }
-                        
+
                         // Update atomic counter instead of local variable
                         total_sent_clone.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         bytes_since_last_log += n as u64;
-                        
+
                         // Log data based on logging level
                         match data_logging_clone.as_str() {
                             "minimal" => {
                                 debug!("Server → Backend: {} bytes", n);
-                            },
+                            }
                             "verbose" => {
-                                debug!("Server → Backend [{}]: {} bytes\n{:?}", 
-                                    connection_id_for_client, n, 
-                                    String::from_utf8_lossy(&server_to_backend_buffer[..std::cmp::min(n, 100)]));
-                            },
+                                debug!(
+                                    "Server → Backend [{}]: {} bytes\n{:?}",
+                                    connection_id_for_client,
+                                    n,
+                                    String::from_utf8_lossy(
+                                        &server_to_backend_buffer[..std::cmp::min(n, 100)]
+                                    )
+                                );
+                            }
                             _ => {}
                         }
-                        
+
                         // Log periodically for large transfers
-                        if bytes_since_last_log > 1024 * 1024 && last_log_time.elapsed() > Duration::from_secs(5) {
+                        if bytes_since_last_log > 1024 * 1024
+                            && last_log_time.elapsed() > Duration::from_secs(5)
+                        {
                             let elapsed_secs = last_log_time.elapsed().as_secs_f64();
                             let rate = bytes_since_last_log as f64 / elapsed_secs / 1024.0;
-                            info!("Server → Backend: {:.2} KB/s ({} bytes in {:.1}s)", 
-                                rate, bytes_since_last_log, elapsed_secs);
+                            info!(
+                                "Server → Backend: {:.2} KB/s ({} bytes in {:.1}s)",
+                                rate, bytes_since_last_log, elapsed_secs
+                            );
                             bytes_since_last_log = 0;
                             last_log_time = Instant::now();
                         }
-                        
+
                         // Write to backend
-                        if let Err(e) = backend_write.write_all(&server_to_backend_buffer[..n]).await {
+                        if let Err(e) = backend_write
+                            .write_all(&server_to_backend_buffer[..n])
+                            .await
+                        {
                             warn!("Error writing to backend: {}", e);
                             break;
                         }
-                        
+
                         // Flush explicitly
                         if let Err(e) = backend_write.flush().await {
                             warn!("Error flushing to backend: {}", e);
@@ -1899,17 +2060,17 @@ async fn handle_legacy_connection(
             }
             let _ = stop_tx_clone.send(()).await;
         });
-        
+
         // Backend to server task
         let connection_id_for_backend = connection_id.clone();
         let backend_to_server = tokio::spawn(async move {
             let mut last_log_time = Instant::now();
             let mut bytes_since_last_log = 0u64;
-            
+
             // HTTP response state tracking
             let mut response_data = Vec::new(); // Buffer to collect partial HTTP responses
             let mut awaiting_response = is_keep_alive_http; // Start waiting for response for keep-alive HTTP
-            
+
             loop {
                 match backend_read.read(&mut backend_to_server_buffer).await {
                     Ok(0) => {
@@ -1921,65 +2082,78 @@ async fn handle_legacy_connection(
                         if is_keep_alive_http {
                             // Append to our HTTP buffer
                             response_data.extend_from_slice(&backend_to_server_buffer[..n]);
-                            
+
                             // Try to parse as an HTTP response
                             let mut parser = HttpResponseParser::new();
                             parser.extend(&response_data);
-                            
+
                             if parser.is_complete() {
                                 // We have a complete HTTP response
                                 debug!("Complete HTTP response detected");
                                 awaiting_response = true; // Now wait for the next request
-                                
+
                                 if let Ok(response) = parser.parse() {
                                     debug!("HTTP response parsed: {}", response.status);
-                                    
+
                                     // Check if this is a connection: close response
                                     if response.connection_type == ConnectionType::Close {
                                         let mut state = http_state_clone.lock().await;
                                         *state = ProxyConnectionState::FirstExchange;
-                                        debug!("Connection: close response detected, will terminate after this exchange");
+                                        debug!(
+                                            "Connection: close response detected, will terminate after this exchange"
+                                        );
                                     }
                                 }
-                                
+
                                 // Clear buffer since we've handled this response
                                 response_data.clear();
                             }
                         }
-                        
+
                         // Update atomic counter instead of local variable
-                        total_received_clone.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        total_received_clone
+                            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         bytes_since_last_log += n as u64;
-                        
+
                         // Log data based on logging level
                         match data_logging.as_str() {
                             "minimal" => {
                                 debug!("Backend → Server: {} bytes", n);
-                            },
+                            }
                             "verbose" => {
-                                debug!("Backend → Server [{}]: {} bytes\n{:?}", 
-                                    connection_id_for_backend, n, 
-                                    String::from_utf8_lossy(&backend_to_server_buffer[..std::cmp::min(n, 100)]));
-                            },
+                                debug!(
+                                    "Backend → Server [{}]: {} bytes\n{:?}",
+                                    connection_id_for_backend,
+                                    n,
+                                    String::from_utf8_lossy(
+                                        &backend_to_server_buffer[..std::cmp::min(n, 100)]
+                                    )
+                                );
+                            }
                             _ => {}
                         }
-                        
+
                         // Log periodically for large transfers
-                        if bytes_since_last_log > 1024 * 1024 && last_log_time.elapsed() > Duration::from_secs(5) {
+                        if bytes_since_last_log > 1024 * 1024
+                            && last_log_time.elapsed() > Duration::from_secs(5)
+                        {
                             let elapsed_secs = last_log_time.elapsed().as_secs_f64();
                             let rate = bytes_since_last_log as f64 / elapsed_secs / 1024.0;
-                            info!("Backend → Server: {:.2} KB/s ({} bytes in {:.1}s)", 
-                                rate, bytes_since_last_log, elapsed_secs);
+                            info!(
+                                "Backend → Server: {:.2} KB/s ({} bytes in {:.1}s)",
+                                rate, bytes_since_last_log, elapsed_secs
+                            );
                             bytes_since_last_log = 0;
                             last_log_time = Instant::now();
                         }
-                        
+
                         // Write to server
-                        if let Err(e) = server_write.write_all(&backend_to_server_buffer[..n]).await {
+                        if let Err(e) = server_write.write_all(&backend_to_server_buffer[..n]).await
+                        {
                             warn!("Error writing to server: {}", e);
                             break;
                         }
-                        
+
                         // Flush explicitly
                         if let Err(e) = server_write.flush().await {
                             warn!("Error flushing to server: {}", e);
@@ -1996,11 +2170,11 @@ async fn handle_legacy_connection(
                     }
                 }
             }
-            
+
             // Send stop signal after loop exits
             let _ = stop_tx.send(()).await;
         });
-        
+
         // Wait for either direction to complete or idle timeout
         if let Some(idle_duration) = idle_duration {
             tokio::select! {
@@ -2016,14 +2190,14 @@ async fn handle_legacy_connection(
             let _ = stop_rx.recv().await;
             info!("Connection complete");
         };
-        
+
         // Wait for tasks to complete before getting the summary (avoid reference errors)
         let _ = tokio::try_join!(server_to_backend, backend_to_server);
-        
+
         // Get the final byte counts from the atomic counters
         let total_sent_final = total_sent.load(std::sync::atomic::Ordering::Relaxed);
         let total_received_final = total_received.load(std::sync::atomic::Ordering::Relaxed);
-        
+
         // Summarize the session
         let session_duration = start_time.elapsed();
         info!(
@@ -2033,27 +2207,16 @@ async fn handle_legacy_connection(
             total_received_final,
             session_duration.as_secs_f64()
         );
-        
+
         // Calculate throughput if the session lasted at least 1 second
         if session_duration.as_secs() > 0 {
             let sent_rate = total_sent_final as f64 / session_duration.as_secs_f64() / 1024.0;
-            let received_rate = total_received_final as f64 / session_duration.as_secs_f64() / 1024.0;
+            let received_rate =
+                total_received_final as f64 / session_duration.as_secs_f64() / 1024.0;
             info!(
                 "Throughput: sent {:.2} KB/s, received {:.2} KB/s",
                 sent_rate, received_rate
             );
         }
-    }
-}
-
-// Helper function to determine if an error is a common connection closure
-fn is_connection_error(e: &std::io::Error) -> bool {
-    match e.kind() {
-        std::io::ErrorKind::BrokenPipe
-        | std::io::ErrorKind::ConnectionReset
-        | std::io::ErrorKind::ConnectionAborted
-        | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::TimedOut => true,
-        _ => false,
     }
 }
