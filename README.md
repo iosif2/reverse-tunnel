@@ -47,3 +47,87 @@ cargo run --bin client -- ...
 ## 라이선스
 본 프로젝트는 LICENSE 파일을 참고하세요.
 
+
+## 테스트
+HTTP 서버를 테스트할 수 있는 curl 명령어들을 만들어드릴게요:
+
+### 기본 GET 요청
+```bash
+curl -v http://localhost:3000/
+```
+
+### POST 요청 (JSON body)
+```bash
+curl -v -X POST http://localhost:3000/ \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: TestClient/1.0" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{"name": "test", "value": 42, "active": true}'
+```
+
+### 복잡한 헤더와 body
+```bash
+curl -v -X PUT http://localhost:3000/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -H "X-API-Key: abc123def456" \
+  -H "X-Request-ID: req-$(date +%s)" \
+  -H "User-Agent: MyApp/2.1.0 (Linux x86_64)" \
+  -H "Accept-Language: ko-KR,ko;q=0.9,en;q=0.8" \
+  -H "Cache-Control: no-cache" \
+  -d '{
+    "user": {
+      "id": 123,
+      "name": "홍길동",
+      "email": "hong@example.com",
+      "preferences": {
+        "theme": "dark",
+        "notifications": true
+      }
+    },
+    "metadata": {
+      "source": "mobile",
+      "version": "2.1.0"
+    }
+  }'
+```
+
+### WebSocket 업그레이드 테스트
+```bash
+curl -v -X GET http://localhost:3000/ \
+  -H "Upgrade: websocket" \
+  -H "Connection: Upgrade" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  -H "Sec-WebSocket-Version: 13"
+```
+
+### 파일 업로드 시뮬레이션
+```bash
+curl -v -X POST http://localhost:8080/upload \
+  -H "Content-Type: multipart/form-data" \
+  -H "X-Upload-Session: session-$(uuidgen)" \
+  -F "file=@/dev/null" \
+  -F "description=테스트 파일"
+```
+
+### 랜덤 헤더와 body (한 줄로)
+```bash
+curl -v -X POST http://localhost:8080/random \
+  -H "X-Random-Header: $(openssl rand -hex 8)" \
+  -H "X-Timestamp: $(date +%s)" \
+  -H "Content-Type: application/json" \
+  -d "{\"random\": \"$(openssl rand -base64 32)\", \"timestamp\": $(date +%s)}"
+```
+
+### 여러 요청을 연속으로 보내기
+```bash
+for i in {1..5}; do
+  curl -v -X POST http://localhost:8080/batch \
+    -H "X-Request-Number: $i" \
+    -H "Content-Type: application/json" \
+    -d "{\"id\": $i, \"data\": \"request-$i\"}"
+  echo "--- Request $i completed ---"
+done
+```
+
+가장 유용한 건 **복잡한 헤더와 body** 명령어입니다. 이걸로 서버가 헤더와 본문을 제대로 파싱하는지 확인할 수 있어요!

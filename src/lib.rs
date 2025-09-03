@@ -1,13 +1,9 @@
+pub mod client;
 pub mod common;
-pub mod http_utils;
 pub mod server;
-
 pub use common::errors::*;
-pub use common::types::*;
-
-pub use http_utils::*;
-
-pub use server::utils::logging::*;
+pub use common::http_conn::*;
+pub use common::logging::*;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

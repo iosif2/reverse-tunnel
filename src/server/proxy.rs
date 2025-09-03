@@ -1,5 +1,5 @@
 use crate::common::errors::is_connection_error;
-use crate::http_utils::{ConnectionType, HttpResponseParser};
+use crate::common::http_conn::{ConnectionType, HttpResponseParser};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -49,7 +49,7 @@ pub async fn handle_one_time_proxy(public_stream: &mut TcpStream, client_stream:
                 let mut has_chunked_encoding = false;
                 let mut content_length = None;
                 let mut headers_end = 0;
-                let mut is_complete = response_parser.is_complete();
+                let is_complete = response_parser.is_complete();
 
                 if let Ok(response) = response_parser.parse() {
                     // 연결 타입 확인

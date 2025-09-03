@@ -1,6 +1,6 @@
-use crate::common::types::ProxyClientInfo;
 use crate::server::handlers::http::parse_http_request;
 use crate::server::handlers::tcp::handle_public_connection;
+use crate::server::types::ProxyClientInfo;
 use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

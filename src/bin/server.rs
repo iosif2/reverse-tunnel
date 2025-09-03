@@ -5,10 +5,10 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use reverse_tunnel::common::types::ProxyClientInfo;
 use reverse_tunnel::server::client_manager::validate_callback_stream;
 use reverse_tunnel::server::config::Args;
 use reverse_tunnel::server::handlers::client::handle_client;
+use reverse_tunnel::server::types::ProxyClientInfo;
 
 #[tokio::main]
 async fn main() {

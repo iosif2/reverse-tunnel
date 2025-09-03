@@ -1,8 +1,4 @@
-use crate::http_utils::{ConnectionType, HttpRequestParser, HttpResponseParser};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
-use tracing::{debug, error, info};
+use crate::common::http_conn::{ConnectionType, HttpRequestParser};
 
 pub fn parse_http_request(data: &[u8]) -> Option<(bool, bool, String)> {
     let mut parser = HttpRequestParser::new();
