@@ -1,6 +1,6 @@
 use chrono;
 use clap::Parser;
-use reverse_tcp_proxy::{
+use reverse_tunnel::{
     ConnectionType, HttpRequestParser, HttpResponseParser, ProxyConnectionState,
     is_connection_error,
 };

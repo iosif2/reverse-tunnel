@@ -1,4 +1,19 @@
-PROJECT_NAME := my_rust_project
+#
+# Copyright 2025 iosif.dev 
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+PROJECT_NAME := reverse_tunnel
 
 .PHONY: all build release test run clean
 
@@ -29,7 +44,7 @@ http_server:
 	@cargo run --bin http-server
 
 help:
-	@echo "Makefile for $(PROJECT_NAME) Rust project:"
+	@echo "Makefile for $(PROJECT_NAME) Reverse Tunnel:"
 	@echo "  all     - Builds the project (same as 'build')"
 	@echo "  build   - Builds the project in debug mode"
 	@echo "  release - Builds the project in release mode"

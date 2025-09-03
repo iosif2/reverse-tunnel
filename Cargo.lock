@@ -781,7 +781,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "reverse_tcp_proxy"
+name = "reverse_tunnel"
 version = "0.1.0"
 dependencies = [
  "axum",
