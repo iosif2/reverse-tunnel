@@ -1,10 +1,21 @@
 use axum::http::Request;
-use axum::{Json, Router, body::Body, http::StatusCode, routing::{get, post}};
+use axum::{
+    Json, Router,
+    body::Body,
+    http::StatusCode,
+    routing::{get, post},
+};
+use clap::Parser;
 use log::info;
-use reverse_tunnel::common::http_conn::parser::request::HttpRequestParser;
-use reverse_tunnel::common::http_conn::types::{HttpRequest, serialize_http_request_to_bytes};
+use reverse_tunnel::prelude::{HttpRequest, HttpRequestParser, serialize_http_request_to_bytes};
 use serde::Serialize;
 use std::net::SocketAddr;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long = "port", short = 'p', default_value = "3000")]
+    port: u16,
+}
 
 #[derive(Serialize)]
 struct HealthCheckResponse {
@@ -15,11 +26,12 @@ struct HealthCheckResponse {
 #[tokio::main]
 async fn main() {
     log4rs::init_file("log4rs.yml", Default::default()).unwrap();
+    let args = Args::parse();
     // 헬스 체크 핸들러 함수를 라우터에 연결
     let app = Router::new().route("/", get(health_check_handler));
     let app = app.merge(Router::new().route("/", post(health_check_handler)));
     // 서버 주소 설정
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     info!("Server running on {}", addr);
 
     // 서버 시작

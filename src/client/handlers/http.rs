@@ -4,7 +4,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info};
 
 use crate::client::ProxyResult;
-use crate::common::http_conn::{ConnectionType, HttpResponseParser};
+use crate::common::{ConnectionType, HttpResponseParser};
 
 pub async fn handle_one_time_http_request(
     mut server_stream: TcpStream,

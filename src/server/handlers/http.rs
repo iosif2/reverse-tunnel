@@ -1,4 +1,4 @@
-use crate::common::http_conn::{ConnectionType, HttpRequestParser};
+use crate::prelude::{ConnectionType, HttpRequestParser};
 
 pub fn parse_http_request(data: &[u8]) -> Option<(bool, bool, String)> {
     let mut parser = HttpRequestParser::new();

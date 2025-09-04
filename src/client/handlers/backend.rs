@@ -1,10 +1,9 @@
-use crate::client::ProxyResult;
-use crate::client::connection::ConnectionPool;
-use crate::client::handlers::{handle_one_time_http_request, handle_websocket_connection};
-use crate::common::errors::is_connection_error;
-use crate::common::http_conn::{
+use crate::client::{
+    ConnectionPool, ProxyResult, handle_one_time_http_request, handle_websocket_connection,
+};
+use crate::common::{
     ConnectionType, HttpRequestParser, HttpResponseParser, ProxyConnectionState,
-    is_websocket_upgrade_response,
+    is_connection_error, is_websocket_upgrade_response,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

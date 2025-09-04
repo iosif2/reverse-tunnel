@@ -1,17 +1,14 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
-
-use crate::client::handlers::handle_one_time_http_request;
-use crate::client::handlers::handle_websocket_connection;
-use crate::common::errors::is_connection_error;
-use crate::common::http_conn::{
+use crate::client::{handle_one_time_http_request, handle_websocket_connection};
+use crate::common::{
     ConnectionType, HttpRequestParser, HttpResponseParser, ProxyConnectionState,
+    is_connection_error,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 // Add a helper function to handle legacy connections:
 pub async fn handle_legacy_connection(

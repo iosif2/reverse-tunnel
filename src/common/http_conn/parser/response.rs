@@ -1,6 +1,6 @@
-use crate::common::http_conn::connection::determine_connection_type;
-use crate::common::http_conn::types::HttpResponse;
-use crate::common::http_conn::upgrade::is_websocket_upgrade_response;
+use crate::common::http_conn::{
+    HttpResponse, determine_connection_type, is_websocket_upgrade_response,
+};
 use bytes::BytesMut;
 use http::HeaderMap;
 use httparse;

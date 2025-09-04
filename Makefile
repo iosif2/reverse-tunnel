@@ -41,7 +41,7 @@ client:
 	@cargo run --bin client -- -s 127.0.0.1:8888 -p 9999 -b 3000
 
 http_server:
-	@cargo run --bin http-server
+	@cargo run --bin http-server -- -p 8080
 
 help:
 	@echo "Makefile for $(PROJECT_NAME) Reverse Tunnel:"

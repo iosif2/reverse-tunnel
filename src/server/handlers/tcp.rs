@@ -1,7 +1,8 @@
-use crate::common::errors::is_connection_error;
-use crate::common::http_conn::{ConnectionType, HttpRequestParser, ProxyConnectionState};
-use crate::common::logging::{log_data_sample, log_transfer_summary};
-use crate::server::proxy::{handle_one_time_proxy, handle_websocket_proxy};
+use crate::common::{
+    ConnectionType, HttpRequestParser, ProxyConnectionState, is_connection_error, log_data_sample,
+    log_transfer_summary,
+};
+use crate::server::{handle_one_time_proxy, handle_websocket_proxy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};

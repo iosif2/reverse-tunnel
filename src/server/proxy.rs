@@ -1,5 +1,4 @@
-use crate::common::errors::is_connection_error;
-use crate::common::http_conn::{ConnectionType, HttpResponseParser};
+use crate::common::{ConnectionType, HttpResponseParser, is_connection_error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};

@@ -1,13 +1,8 @@
-use chrono;
 use clap::Parser;
-use reverse_tunnel::client::ProxyResult;
-use reverse_tunnel::client::config::Args;
-use reverse_tunnel::client::handlers::connect_and_serve;
-use socket2;
+use reverse_tunnel::client::{Args, connect_and_serve};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tracing::{error, info};
 
 #[tokio::main]

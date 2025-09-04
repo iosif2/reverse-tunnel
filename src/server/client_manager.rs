@@ -1,4 +1,4 @@
-use crate::server::types::ProxyClientInfo;
+use crate::server::ProxyClientInfo;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;

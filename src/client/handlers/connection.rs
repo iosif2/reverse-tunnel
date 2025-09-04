@@ -1,18 +1,14 @@
-use tokio::io::BufReader;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
 
-use crate::client::ProxyResult;
-use crate::client::config::Args;
-use crate::client::connection::ConnectionPool;
-use crate::client::handlers::handle_backend_connection;
-use crate::client::handlers::handle_legacy_connection;
+use crate::client::{
+    Args, ConnectionPool, ProxyResult, handle_backend_connection, handle_legacy_connection,
+};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // The main connection and serving logic extracted from main
 pub async fn connect_and_serve(args: &Args, running: Arc<AtomicBool>) -> ProxyResult<()> {
